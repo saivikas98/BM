@@ -17,21 +17,157 @@ import torch.nn.functional as F
 # PAGE CONFIGURATION
 # =====================================================================
 st.set_page_config(
-    page_title="Thermo-Viscous Recirculation PBE-PINN Workbench",
+    page_title="NETZSCH DeltaVita Thermo-Viscous PBE-PINN Workbench",
     page_icon="⚙️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # =====================================================================
-# 1. PROCESS & PHYSICS CONFIGURATION DATACLASS
+# 1. NETZSCH DELTAVITA EQUIPMENT, CHAMBER LINER & BEAD MEDIA CATALOGS
+# =====================================================================
+NETZSCH_DELTAVITA_MODELS = {
+    "DV 200 (0.20 L Lab Interchangeable)": {
+        "V_m": 0.20,          # Active chamber volume (L)
+        "V_t_default": 1.50,  # Typical recirculation tank volume (L)
+        "Q_default": 0.40,    # Nominal recirculation pump rate (L/min)
+        "P_agit_W": 300.0,    # Nominal shaft power at v_t=10 m/s, Y-ZrO2 (W)
+        "A_mill_m2": 0.022,   # Active cylindrical cooling jacket area (m^2)
+        "A_tank_m2": 0.085,   # Holding tank wetted jacket area (m^2)
+        "wall_mm": 4.5,       # Chamber liner wall thickness (mm)
+    },
+    "DV 300 (0.30 L R&D / Late-Discovery)": {
+        "V_m": 0.30,
+        "V_t_default": 2.50,
+        "Q_default": 0.60,
+        "P_agit_W": 450.0,
+        "A_mill_m2": 0.029,
+        "A_tank_m2": 0.120,
+        "wall_mm": 5.0,
+    },
+    "DV 600 (0.60 L Pilot / Clinical Supply)": {
+        "V_m": 0.60,
+        "V_t_default": 6.00,
+        "Q_default": 1.20,
+        "P_agit_W": 900.0,
+        "A_mill_m2": 0.046,
+        "A_tank_m2": 0.215,
+        "wall_mm": 6.0,
+    },
+    "DV 2000 (2.00 L GMP Production)": {
+        "V_m": 2.00,
+        "V_t_default": 20.00,
+        "Q_default": 4.00,
+        "P_agit_W": 3000.0,
+        "A_mill_m2": 0.103,
+        "A_tank_m2": 0.480,
+        "wall_mm": 8.0,
+    },
+}
+
+CHAMBER_LINER_MATERIALS = {
+    "Stainless Steel (AISI 316L Pharma Ra <= 0.4 um)": {
+        "family": "Stainless Steel",
+        "k_wall_WmK": 16.2,       # Thermal conductivity W/(m*K)
+        "wear_factor": 1.45,      # Relative liner wear multiplier (Fe/Cr/Ni shedding)
+        "metal_free": False,
+        "max_tip_speed_ms": 14.0,
+    },
+    "Ceramic - NETZSCH-Ceram C (Sintered SiC)": {
+        "family": "Ceramic (SiC)",
+        "k_wall_WmK": 110.0,      # High-conductivity silicon carbide ceramic
+        "wear_factor": 0.65,
+        "metal_free": True,
+        "max_tip_speed_ms": 16.0,
+    },
+    "Ceramic - NETZSCH-Ceram N (Silicon Nitride Si3N4)": {
+        "family": "Ceramic (Si3N4)",
+        "k_wall_WmK": 28.0,       # High fracture-toughness silicon nitride ceramic
+        "wear_factor": 0.75,
+        "metal_free": True,
+        "max_tip_speed_ms": 15.5,
+    },
+    "Ceramic - NETZSCH-Ceram Z (Zirconia ZrO2)": {
+        "family": "Ceramic (ZrO2)",
+        "k_wall_WmK": 2.2,        # Insulating monolithic zirconia ceramic
+        "wear_factor": 0.85,
+        "metal_free": True,
+        "max_tip_speed_ms": 13.0,
+    },
+}
+
+BEAD_MEDIA_TYPES = {
+    "Zirconium Oxide - VitaBeaDs NaNo (Y-ZrO2, 6050 kg/m3)": {
+        "category": "Zirconium",
+        "rho_kgm3": 6050.0,
+        "hardness_HV": 1250.0,
+        "base_wear_ppm_per_kWh_kg": 18.0,
+        "contaminant_label": "ZrO2 / Y2O3",
+    },
+    "Zirconium Oxide - Ceria-Stabilized (Ce-ZrO2, 6200 kg/m3)": {
+        "category": "Zirconium",
+        "rho_kgm3": 6200.0,
+        "hardness_HV": 1150.0,
+        "base_wear_ppm_per_kWh_kg": 29.0,
+        "contaminant_label": "ZrO2 / CeO2",
+    },
+    "Ceramic - Zirconia-Toughened Alumina (ZTA, 4150 kg/m3)": {
+        "category": "Ceramic",
+        "rho_kgm3": 4150.0,
+        "hardness_HV": 1400.0,
+        "base_wear_ppm_per_kWh_kg": 38.0,
+        "contaminant_label": "Al2O3 / ZrO2",
+    },
+    "Ceramic - Sintered High-Purity Alumina (Al2O3, 3850 kg/m3)": {
+        "category": "Ceramic",
+        "rho_kgm3": 3850.0,
+        "hardness_HV": 1550.0,
+        "base_wear_ppm_per_kWh_kg": 55.0,
+        "contaminant_label": "Al2O3",
+    },
+    "Ceramic - Silicon Nitride (Si3N4, 3250 kg/m3)": {
+        "category": "Ceramic",
+        "rho_kgm3": 3250.0,
+        "hardness_HV": 1500.0,
+        "base_wear_ppm_per_kWh_kg": 22.0,
+        "contaminant_label": "Si3N4",
+    },
+}
+
+
+def compute_netzsch_chamber_ua(
+    model_key: str,
+    chamber_key: str,
+    h_slurry_Wm2K: float = 1400.0,
+    h_coolant_Wm2K: float = 2200.0,
+    U_tank_Wm2K: float = 380.0,
+) -> Tuple[float, float, float]:
+    """
+    Computes physical Mill Jacket Conductance UA_mill (W/K), Tank Jacket UA_tank (W/K),
+    and Overall Mill Heat Transfer Coefficient U_mill (W/(m^2*K)) from liner thermal conductivity.
+    """
+    m_spec = NETZSCH_DELTAVITA_MODELS[model_key]
+    c_spec = CHAMBER_LINER_MATERIALS[chamber_key]
+
+    delta_m = m_spec["wall_mm"] * 1e-3
+    k_wall = c_spec["k_wall_WmK"]
+
+    R_total = (1.0 / h_slurry_Wm2K) + (delta_m / k_wall) + (1.0 / h_coolant_Wm2K)
+    U_mill = 1.0 / R_total
+    UA_mill = U_mill * m_spec["A_mill_m2"]
+    UA_tank = U_tank_Wm2K * m_spec["A_tank_m2"]
+    return float(UA_mill), float(UA_tank), float(U_mill)
+
+
+# =====================================================================
+# 2. PROCESS & PHYSICS CONFIGURATION DATACLASS
 # =====================================================================
 @dataclass
 class MillLoopConfig:
     # Geometric & Flow Parameters
-    V_m: float = 0.50            # Active mill chamber volume (L)
-    V_t: float = 4.50            # Recirculation holding tank volume (L)
-    Q: float = 1.00              # Volumetric flow rate (L/min)
+    V_m: float = 0.30            # Active mill chamber volume (L)
+    V_t: float = 2.50            # Recirculation holding tank volume (L)
+    Q: float = 0.60              # Volumetric flow rate (L/min)
     t_max: float = 60.0          # Total batch grinding time (min)
 
     # Discretization Grid
@@ -49,13 +185,13 @@ class MillLoopConfig:
     E_mu_over_R: float = 1850.0  # Solvent Andrade/Arrhenius constant E_mu/R (K)
 
     # Thermal & Agitator Power Parameters
-    P_agit_W: float = 650.0      # Nominal agitator shaft power at mu_ref (W)
+    P_agit_W: float = 450.0      # Nominal agitator shaft power at mu_ref (W)
     eta_diss: float = 0.88       # Fraction of shaft power dissipated as heat (-)
     alpha_P: float = 0.15        # Viscosity exponent on power draw (-)
-    UA_mill: float = 18.0        # Mill jacket overall heat transfer coeff * area (W/K)
-    UA_tank: float = 28.0        # Holding tank jacket UA (W/K)
+    UA_mill: float = 26.5        # Mill jacket overall heat transfer coeff * area (W/K)
+    UA_tank: float = 45.6        # Holding tank jacket UA (W/K)
     T_cool_m: float = 288.15     # Mill chiller coolant supply temp (K) [15.0 C]
-    T_cool_t: float = 291.15     # Tank jacket coolant supply temp (K) [18.0 C]
+    T_cool_t: float = 290.15     # Tank jacket coolant supply temp (K) [17.0 C]
     T_init: float = 298.15       # Initial homogenized loop temperature (K) [25.0 C]
 
     @property
@@ -84,7 +220,7 @@ class MillLoopConfig:
 
 
 # =====================================================================
-# 2. FORWARD DIGITAL TWIN (RK45 COUPLED PBE + THERMAL + RHEOLOGY SOLVER)
+# 3. FORWARD DIGITAL TWIN & KWADE STRESS-ENERGY SCALING FUNCTIONS
 # =====================================================================
 def assemble_numpy_base_kernel(
     x: np.ndarray, alpha: float, phi: float, gamma: float, beta: float
@@ -109,7 +245,9 @@ def assemble_numpy_base_kernel(
     return K_tilde
 
 
-def compute_psd_quantiles_numpy(x: np.ndarray, w_matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def compute_psd_quantiles_numpy(
+    x: np.ndarray, w_matrix: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Computes D10, D50, D90, and Sauter Mean Diameter D32 across time.
     w_matrix: shape (T_steps, N) where index 0 is coarsest and N-1 is finest.
@@ -123,7 +261,6 @@ def compute_psd_quantiles_numpy(x: np.ndarray, w_matrix: np.ndarray) -> Tuple[np
     d10, d50, d90 = np.zeros(len(w_matrix)), np.zeros(len(w_matrix)), np.zeros(len(w_matrix))
     for k in range(len(w_matrix)):
         cdf_k = q3_asc[k]
-        # Ensure strictly increasing grid for interpolation
         _, unique_idx = np.unique(cdf_k, return_index=True)
         if len(unique_idx) >= 2:
             d10[k] = np.exp(np.interp(0.10, cdf_k[unique_idx], log_x_asc[unique_idx]))
@@ -162,7 +299,6 @@ def simulate_coupled_mill_tank_loop(
 
     K_tilde = assemble_numpy_base_kernel(x, alpha, phi, gamma, beta)
 
-    # Convert W (J/s) to J/min for time in minutes
     sec_per_min = 60.0
     C_mill = cfg.rho_slurry * cfg.Cp_slurry * cfg.V_m  # J/K
     C_tank = cfg.rho_slurry * cfg.Cp_slurry * cfg.V_t  # J/K
@@ -212,7 +348,6 @@ def simulate_coupled_mill_tank_loop(
     T_m_traj = sol.y[2*N, :]
     T_t_traj = sol.y[2*N + 1, :]
 
-    # Recompute auxiliary trajectories (mu_eff, S0_t, quantiles)
     inv_T_diff = (1.0 / T_m_traj) - (1.0 / cfg.T_ref)
     mu_solv = (cfg.mu_ref / crowd_factor) * np.exp(cfg.E_mu_over_R * inv_T_diff)
     d10_m, d50_m, d90_m, d32_m = compute_psd_quantiles_numpy(x, w_m_traj)
@@ -237,8 +372,140 @@ def simulate_coupled_mill_tank_loop(
     }
 
 
+def compute_kwade_stress_scaling(
+    d_gm_um: float,
+    v_tip_ms: float,
+    phi_gm: float,
+    rho_gm_kgm3: float,
+    SE_opt_mJ: float,
+    d_gm_lab_um: float = 400.0,
+    v_tip_lab_ms: float = 10.0,
+    phi_gm_lab: float = 0.80,
+    rho_gm_lab_kgm3: float = 6050.0,
+    sigma_se: float = 0.85,
+) -> Dict[str, float]:
+    """
+    Computes Kwade's Stress Energy SE_GM (mJ), energy transfer efficiency eta_SE,
+    specific power multiplier (P/V)_pilot / (P/V)_lab, relative collision frequency f_c,
+    and net S0_ref scaling multiplier.
+    """
+    d_m = d_gm_um * 1e-6
+    d_lab_m = d_gm_lab_um * 1e-6
+    SE_pilot_mJ = (d_m ** 3) * (v_tip_ms ** 2) * rho_gm_kgm3 * 1e3
+    SE_lab_mJ = (d_lab_m ** 3) * (v_tip_lab_ms ** 2) * rho_gm_lab_kgm3 * 1e3
+
+    def calc_eta_se(se_val: float) -> float:
+        log_ratio = np.log(max(se_val, 1e-9) / max(SE_opt_mJ, 1e-9))
+        gauss_term = np.exp(-0.5 * ((log_ratio / sigma_se) ** 2))
+        excess_penalty = (se_val / SE_opt_mJ) ** (-0.25) if se_val > SE_opt_mJ else 1.0
+        return float(gauss_term * excess_penalty)
+
+    eta_pilot = calc_eta_se(SE_pilot_mJ)
+    eta_lab = calc_eta_se(SE_lab_mJ)
+
+    eps_pack = 0.38
+    g_pilot = (phi_gm * (1.0 - phi_gm)) / ((1.0 - phi_gm * (1.0 - eps_pack)) ** 2)
+    g_lab = (phi_gm_lab * (1.0 - phi_gm_lab)) / ((1.0 - phi_gm_lab * (1.0 - eps_pack)) ** 2)
+
+    power_density_ratio = (
+        ((v_tip_ms / v_tip_lab_ms) ** 2.75)
+        * ((phi_gm / phi_gm_lab) ** 1.35)
+        * ((rho_gm_kgm3 / rho_gm_lab_kgm3) ** 0.85)
+        * ((d_gm_um / d_gm_lab_um) ** 0.15)
+    )
+
+    rel_stress_freq = (
+        power_density_ratio * (SE_lab_mJ / max(SE_pilot_mJ, 1e-9)) * (g_pilot / g_lab)
+    )
+    S0_multiplier = power_density_ratio * (eta_pilot / max(eta_lab, 1e-6)) * (g_pilot / g_lab)
+
+    return {
+        "SE_pilot_mJ": SE_pilot_mJ,
+        "SE_lab_mJ": SE_lab_mJ,
+        "SE_ratio_to_opt": SE_pilot_mJ / max(SE_opt_mJ, 1e-9),
+        "eta_pilot": eta_pilot,
+        "eta_lab": eta_lab,
+        "power_density_ratio": power_density_ratio,
+        "rel_stress_freq": rel_stress_freq,
+        "S0_multiplier": S0_multiplier,
+    }
+
+
+def compute_thermal_and_energy_metrics(
+    cfg: MillLoopConfig, sim: Dict[str, np.ndarray], w_solids_mass_frac: float = 0.24
+) -> Dict[str, np.ndarray]:
+    """
+    Computes instantaneous shaft power (kW), heat generation (kW), mill/tank jacket
+    heat removal duties (kW), and cumulative specific energy E_m (kWh/kg_solids).
+    """
+    t_sec = sim["t"] * 60.0
+    P_shaft_W = cfg.P_agit_W * ((sim["mu_eff"] / cfg.mu_ref) ** cfg.alpha_P)
+    Q_gen_W = cfg.eta_diss * P_shaft_W
+    Q_jacket_mill_W = cfg.UA_mill * (sim["T_m"] - cfg.T_cool_m)
+    Q_jacket_tank_W = cfg.UA_tank * (sim["T_t"] - cfg.T_cool_t)
+
+    E_cum_J = np.zeros_like(t_sec)
+    if len(t_sec) > 1:
+        dt_sec = np.diff(t_sec)
+        E_cum_J[1:] = np.cumsum(0.5 * (P_shaft_W[:-1] + P_shaft_W[1:]) * dt_sec)
+
+    total_slurry_kg = (cfg.rho_slurry / 1000.0) * (cfg.V_m + cfg.V_t)
+    total_solids_kg = max(total_slurry_kg * w_solids_mass_frac, 1e-6)
+    E_specific_kWh_kg = E_cum_J / (3.6e6 * total_solids_kg)
+
+    return {
+        "P_shaft_kW": P_shaft_W / 1000.0,
+        "Q_gen_kW": Q_gen_W / 1000.0,
+        "Q_mill_kW": Q_jacket_mill_W / 1000.0,
+        "Q_tank_kW": Q_jacket_tank_W / 1000.0,
+        "Q_total_cool_kW": (Q_jacket_mill_W + Q_jacket_tank_W) / 1000.0,
+        "E_specific_kWh_kg": E_specific_kWh_kg,
+    }
+
+
+def solve_required_pilot_cooling(
+    pilot_base_cfg: MillLoopConfig,
+    scaled_params: Dict[str, float],
+    w0: np.ndarray,
+    t_eval: np.ndarray,
+    T_max_limit_K: float,
+) -> Dict[str, float]:
+    """
+    Bisection solver finding the exact overall mill cooling conductance UA_mill_req (W/K)
+    required to cap max(T_m(t)) <= T_max_limit_K.
+    """
+    sim_baseline = simulate_coupled_mill_tank_loop(pilot_base_cfg, scaled_params, w0, t_eval)
+    peak_T_geom = float(np.max(sim_baseline["T_m"]))
+
+    if peak_T_geom <= T_max_limit_K:
+        return {
+            "UA_mill_req": pilot_base_cfg.UA_mill,
+            "UA_supplemental_HX": 0.0,
+            "peak_T_geom_C": peak_T_geom - 273.15,
+            "needs_supplemental_cooling": False,
+        }
+
+    ua_low = pilot_base_cfg.UA_mill
+    ua_high = pilot_base_cfg.UA_mill * 18.0
+    for _ in range(16):
+        ua_mid = 0.5 * (ua_low + ua_high)
+        test_cfg = MillLoopConfig(**{**pilot_base_cfg.__dict__, "UA_mill": ua_mid})
+        sim_test = simulate_coupled_mill_tank_loop(test_cfg, scaled_params, w0, t_eval)
+        if float(np.max(sim_test["T_m"])) > T_max_limit_K:
+            ua_low = ua_mid
+        else:
+            ua_high = ua_mid
+
+    return {
+        "UA_mill_req": ua_high,
+        "UA_supplemental_HX": max(ua_high - pilot_base_cfg.UA_mill, 0.0),
+        "peak_T_geom_C": peak_T_geom - 273.15,
+        "needs_supplemental_cooling": True,
+    }
+
+
 # =====================================================================
-# 3. PYTORCH THERMO-VISCOUS PBE KERNEL & DUAL-STATE PINN MODULES
+# 4. PYTORCH THERMO-VISCOUS PBE KERNEL & DUAL-STATE PINN MODULES
 # =====================================================================
 class ThermoViscousPBEKernels(nn.Module):
     """
@@ -365,7 +632,7 @@ class CoupledThermoViscousPINN(nn.Module):
         self.n_bins = n_bins
         self.t_max = t_max
         self.T_ref = T_ref
-        self.T_scale = 25.0  # Characteristic temperature rise scale (K)
+        self.T_scale = 25.0
 
         self.trunk = nn.Sequential(
             nn.Linear(1, hidden_dim),
@@ -377,7 +644,7 @@ class CoupledThermoViscousPINN(nn.Module):
         )
         self.head_w_m = nn.Linear(hidden_dim, n_bins)
         self.head_w_t = nn.Linear(hidden_dim, n_bins)
-        self.head_T = nn.Linear(hidden_dim, 2)  # [delta_T_m, delta_T_t]
+        self.head_T = nn.Linear(hidden_dim, 2)
 
     def _raw_forward_concat(self, t: torch.Tensor) -> torch.Tensor:
         t_norm = t / self.t_max
@@ -393,9 +660,6 @@ class CoupledThermoViscousPINN(nn.Module):
         return out[:, :N], out[:, N:2*N], out[:, 2*N:2*N+1], out[:, 2*N+1:2*N+2]
 
     def forward_with_jvp_time_derivatives(self, t: torch.Tensor):
-        """
-        Computes all states and their exact first time derivatives d/dt in ONE single JVP pass.
-        """
         tangent = torch.ones_like(t)
         out, dout_dt = torch.autograd.functional.jvp(
             self._raw_forward_concat, (t,), (tangent,), create_graph=True
@@ -410,7 +674,7 @@ class CoupledThermoViscousPINN(nn.Module):
 
 
 # =====================================================================
-# 4. COMPOSITE PHYSICS + DATA LOSS & FISHER INFORMATION IDENTIFIABILITY
+# 5. COMPOSITE PHYSICS + DATA LOSS & FISHER INFORMATION IDENTIFIABILITY
 # =====================================================================
 def evaluate_coupled_pinn_losses(
     pinn: CoupledThermoViscousPINN,
@@ -439,7 +703,7 @@ def evaluate_coupled_pinn_losses(
         loss_visc = F.mse_loss(torch.log(mu_pred_obs), torch.log(mu_obs))
         loss_data = loss_data + 0.15 * loss_visc
 
-    # 2. Initial Condition Loss at t = 0 (Pre-homogenized recirculation loop)
+    # 2. Initial Condition Loss at t = 0
     t_zero = torch.zeros((1, 1), dtype=torch.float32, device=t_obs.device)
     w_m0, w_t0, T_m0, T_t0, _, dw_t0_dt, _, _ = pinn.forward_with_jvp_time_derivatives(t_zero)
     T_init_th = torch.full_like(T_m0, cfg.T_init)
@@ -456,16 +720,13 @@ def evaluate_coupled_pinn_losses(
         pinn.forward_with_jvp_time_derivatives(t_colloc)
     )
 
-    # 3a. Holding Tank Convective Buffer Residual (Dimensionless)
     res_tank_psd = cfg.tau_t * dw_t_dt - (w_m_c - w_t_c)
     loss_tank_pbe = torch.mean(res_tank_psd ** 2)
 
-    # 3b. Mill Chamber Comminution + Convection Residual (Dimensionless)
     breakage_rate, _, mu_eff_c = kernels.compute_mill_breakage_rate(w_m_c, T_m_c)
     res_mill_psd = cfg.tau_m * dw_m_dt - (w_t_c - w_m_c) - cfg.tau_m * breakage_rate
     loss_mill_pbe = torch.mean(res_mill_psd ** 2)
 
-    # 3c. Mill & Jacketed Holding Tank Energy Balance Residuals (Scaled by 15 K)
     sec_per_min = 60.0
     C_mill = cfg.rho_slurry * cfg.Cp_slurry * cfg.V_m
     C_tank = cfg.rho_slurry * cfg.Cp_slurry * cfg.V_t
@@ -520,7 +781,6 @@ def compute_fisher_correlation_matrix(
         flat_rate = rate_c.reshape(-1)
 
         grads = []
-        # Subsample every 4th residual entry for rapid interactive Jacobian evaluation
         sampled_entries = flat_rate[::4]
         for entry in sampled_entries:
             g = torch.autograd.grad(entry, raw_params, retain_graph=True, allow_unused=True)
@@ -536,22 +796,44 @@ def compute_fisher_correlation_matrix(
 
 
 # =====================================================================
-# SIDEBAR: PROCESS & KERNEL CONFIGURATION
+# SIDEBAR: NETZSCH DELTAVITA LAB MILL & MATERIAL CONFIGURATION
 # =====================================================================
-st.sidebar.title("⚙️ Mill–Tank Loop Config")
+st.sidebar.title("⚙️ NETZSCH DeltaVita® Config")
 
-with st.sidebar.expander("1. Volumes, Flow & Residence Time", expanded=True):
-    V_m_in = st.slider("Mill Active Volume V_m (L)", 0.20, 2.00, 0.50, 0.05)
-    V_t_in = st.slider("Holding Tank Volume V_t (L)", 1.00, 15.00, 4.50, 0.25)
-    Q_in = st.slider("Recirculation Rate Q (L/min)", 0.25, 4.00, 1.00, 0.05)
-    t_max_in = st.slider("Batch Grinding Duration (min)", 20.0, 120.0, 60.0, 5.0)
+with st.sidebar.expander("1. Lab Mill Model, Chamber & Beads", expanded=True):
+    lab_model_key = st.selectbox(
+        "Lab Reference NETZSCH Model",
+        options=list(NETZSCH_DELTAVITA_MODELS.keys()),
+        index=1,  # Default: DV 300 (0.30 L)
+    )
+    lab_chamber_key = st.selectbox(
+        "Lab Grinding Chamber Liner",
+        options=list(CHAMBER_LINER_MATERIALS.keys()),
+        index=1,  # Default: NETZSCH-Ceram C (SiC)
+    )
+    lab_bead_key = st.selectbox(
+        "Lab Grinding Media (Bead) Type",
+        options=list(BEAD_MEDIA_TYPES.keys()),
+        index=0,  # Default: VitaBeaDs NaNo (Y-ZrO2)
+    )
+
+    lab_m_spec = NETZSCH_DELTAVITA_MODELS[lab_model_key]
+    lab_b_spec = BEAD_MEDIA_TYPES[lab_bead_key]
+    UA_m_calc, UA_t_calc, U_m_coeff = compute_netzsch_chamber_ua(lab_model_key, lab_chamber_key)
+
+    V_m_in = st.number_input("Active Chamber Volume V_m (L)", 0.05, 5.00, float(lab_m_spec["V_m"]), 0.05)
+    V_t_in = st.slider("Holding Tank Volume V_t (L)", 0.50, 30.00, float(lab_m_spec["V_t_default"]), 0.25)
+    Q_in = st.slider("Recirculation Rate Q (L/min)", 0.10, 10.00, float(lab_m_spec["Q_default"]), 0.05)
+    t_max_in = st.slider("Batch Grinding Duration (min)", 20.0, 180.0, 60.0, 5.0)
 
 with st.sidebar.expander("2. Thermal & Rheology Constants", expanded=False):
-    P_agit_in = st.slider("Nominal Shaft Power P_0 (W)", 200.0, 1500.0, 650.0, 50.0)
-    UA_mill_in = st.slider("Mill Jacket UA (W/K)", 5.0, 50.0, 18.0, 1.0)
-    UA_tank_in = st.slider("Tank Jacket UA (W/K)", 5.0, 60.0, 28.0, 1.0)
+    P_lab_default = lab_m_spec["P_agit_W"] * ((lab_b_spec["rho_kgm3"] / 6050.0) ** 0.85)
+    P_agit_in = st.slider("Nominal Shaft Power P_0 (W)", 100.0, 4500.0, float(P_lab_default), 25.0)
+    UA_mill_in = st.slider("Mill Jacket UA (W/K) [Auto-computed]", 1.0, 250.0, float(round(UA_m_calc, 1)), 0.5)
+    UA_tank_in = st.slider("Tank Jacket UA (W/K) [Auto-computed]", 2.0, 300.0, float(round(UA_t_calc, 1)), 1.0)
     T_cool_C = st.slider("Chiller Supply Temp (°C)", 5.0, 25.0, 15.0, 1.0)
     phi_v_in = st.slider("Solids Volume Fraction φ_v", 0.05, 0.40, 0.20, 0.01)
+    st.caption(f"Computed Liner U_m = **{U_m_coeff:.0f} W/(m²·K)** | Bead ρ = **{lab_b_spec['rho_kgm3']:.0f} kg/m³**")
 
 with st.sidebar.expander("3. Ground-Truth PBE Kernel Parameters", expanded=True):
     S0_true = st.slider("True S0_ref (min⁻¹)", 0.15, 1.50, 0.65, 0.05)
@@ -593,14 +875,14 @@ sim_data = simulate_coupled_mill_tank_loop(cfg, true_params_dict, w0_vec, t_dens
 # =====================================================================
 # MAIN HEADER & KPI SUMMARY BAR
 # =====================================================================
-st.title("⚙️ Coupled Thermo-Viscous Recirculation PBE-PINN Workbench")
+st.title("⚙️ NETZSCH DeltaVita® Thermo-Viscous Recirculation PBE-PINN Workbench")
 st.markdown(
-    "Deconvolve **holding-tank residence-time lag** ($\tau_t = V_t/Q$), **non-isothermal mill heating**, "
-    "and **fines-driven slurry viscosity** to identify intrinsic population balance kernels $(\mathbf{S}, \mathbf{B})$ in PyTorch."
+    "Deconvolve **holding-tank residence-time lag** ($\tau_t = V_t/Q$), **non-isothermal chamber wall heat transfer (316L SS vs. Ceramic)**, "
+    "and **fines-driven slurry viscosity** to identify intrinsic population balance kernels $(\mathbf{S}, \mathbf{B})$ and scale across **DV 200, DV 300, DV 600, and DV 2000**."
 )
 
 kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
-kpi1.metric("Mill Residence Time (τ_m)", f"{cfg.tau_m:.2f} min", f"V_m = {cfg.V_m:.2f} L")
+kpi1.metric("Mill Residence Time (τ_m)", f"{cfg.tau_m:.2f} min", f"{lab_model_key[:6]} (V_m = {cfg.V_m:.2f} L)")
 kpi2.metric("Tank Lag Time (τ_t)", f"{cfg.tau_t:.2f} min", f"V_t/V_m = {cfg.V_t/cfg.V_m:.1f}x")
 max_d90_lag = float(np.max(sim_data["d90_t"] - sim_data["d90_m"]))
 kpi3.metric("Peak Tank-to-Mill D90 Lag", f"{max_d90_lag:.2f} µm", "Tank coarser than mill")
@@ -609,20 +891,21 @@ kpi4.metric("Peak Mill-to-Tank ΔT", f"+{peak_dT:.2f} °C", f"Max T_m = {np.max(
 kpi5.metric("Final Holding Tank D90", f"{sim_data['d90_t'][-1]:.2f} µm", f"D32 = {sim_data['d32_t'][-1]:.2f} µm")
 
 # =====================================================================
-# WORKBENCH TABS
+# WORKBENCH TABS (5 TABS)
 # =====================================================================
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "1️⃣ Forward Digital Twin & Lag Explorer",
     "2️⃣ Experimental Tank Sampler & CSV I/O",
     "3️⃣ 3-Stage Curriculum Inverse PINN",
     "4️⃣ Deconvolved Mill vs. Tank Diagnostics",
+    "5️⃣ NETZSCH DV200–DV2000 Scale-Up & Kwade Optimizer",
 ])
 
 # ---------------------------------------------------------------------
 # TAB 1: FORWARD DIGITAL TWIN & LAG EXPLORER
 # ---------------------------------------------------------------------
 with tab1:
-    st.subheader("Coupled Mill Chamber vs. Holding Tank Trajectories")
+    st.subheader(f"Coupled Mill Chamber vs. Holding Tank Trajectories ({lab_model_key[:6]})")
     fig_fwd = make_subplots(
         rows=2, cols=2,
         subplot_titles=(
@@ -636,21 +919,17 @@ with tab1:
         horizontal_spacing=0.10,
     )
 
-    # Subplot (1,1): Quantiles
     fig_fwd.add_trace(go.Scatter(x=sim_data["t"], y=sim_data["d90_t"], name="Tank D90 (Sampled)", line=dict(color="#1f77b4", width=3)), row=1, col=1)
     fig_fwd.add_trace(go.Scatter(x=sim_data["t"], y=sim_data["d90_m"], name="Mill D90 (Latent)", line=dict(color="#ff7f0e", width=2.5, dash="dash")), row=1, col=1)
     fig_fwd.add_trace(go.Scatter(x=sim_data["t"], y=sim_data["d50_t"], name="Tank D50", line=dict(color="#2ca02c", width=2)), row=1, col=1)
     fig_fwd.add_trace(go.Scatter(x=sim_data["t"], y=sim_data["d50_m"], name="Mill D50", line=dict(color="#d62728", width=2, dash="dot")), row=1, col=1)
 
-    # Subplot (1,2): Temperatures
     fig_fwd.add_trace(go.Scatter(x=sim_data["t"], y=sim_data["T_m"] - 273.15, name="Mill Chamber T_m (°C)", line=dict(color="#d62728", width=3)), row=1, col=2)
     fig_fwd.add_trace(go.Scatter(x=sim_data["t"], y=sim_data["T_t"] - 273.15, name="Holding Tank T_t (°C)", line=dict(color="#1f77b4", width=3, dash="dash")), row=1, col=2)
 
-    # Subplot (2,1): Viscosity & S0(t)
     fig_fwd.add_trace(go.Scatter(x=sim_data["t"], y=sim_data["mu_eff"] * 1e3, name="Slurry Viscosity μ_eff (mPa·s)", line=dict(color="#9467bd", width=3)), row=2, col=1, secondary_y=False)
     fig_fwd.add_trace(go.Scatter(x=sim_data["t"], y=sim_data["S0_t"], name="Dynamic Selection Rate S0(t) (min⁻¹)", line=dict(color="#2ca02c", width=2.5, dash="dot")), row=2, col=1, secondary_y=True)
 
-    # Subplot (2,2): PSD Snapshot Selector
     snap_min = st.slider("Inspect PSD Snapshot Timestamp (min)", 0.0, float(cfg.t_max), float(min(10.0, cfg.t_max / 3)), 1.0)
     idx_snap = int(np.argmin(np.abs(sim_data["t"] - snap_min)))
     fig_fwd.add_trace(go.Scatter(x=sim_data["x"], y=sim_data["w_m"][0], name="Initial Feed PSD (t=0)", line=dict(color="gray", dash="dot")), row=2, col=2)
@@ -679,7 +958,6 @@ with tab2:
     psd_noise_pct = col_s2.slider("Laser Diffraction Relative Noise (%)", 0.0, 8.0, 2.5, 0.5)
     temp_noise_C = col_s3.slider("Thermocouple Noise Std Dev (°C)", 0.0, 1.0, 0.15, 0.05)
 
-    # Generate synthetic noisy observations from holding tank
     rng = np.random.default_rng(seed=42)
     sample_indices = np.linspace(0, len(sim_data["t"]) - 1, n_samples, dtype=int)
     t_obs_np = sim_data["t"][sample_indices]
@@ -693,7 +971,6 @@ with tab2:
     T_t_noisy = sim_data["T_t"][sample_indices] + temp_noise_C * rng.standard_normal(n_samples)
     mu_noisy = sim_data["mu_eff"][sample_indices] * (1.0 + 0.02 * rng.standard_normal(n_samples))
 
-    # Build DataFrame for inspection & CSV export
     bin_cols = [f"w_t_bin_{i}_{sim_data['x'][i]:.2f}um" for i in range(cfg.n_bins)]
     df_obs = pd.DataFrame(w_t_noisy, columns=bin_cols)
     df_obs.insert(0, "mu_eff_Pas", mu_noisy)
@@ -748,7 +1025,6 @@ with tab3:
         w0_th = torch.tensor(w0_vec[None, :], dtype=torch.float32)
         t_colloc_th = torch.linspace(0.0, cfg.t_max, 120).unsqueeze(-1)
 
-        # Initialize deliberately perturbed initial kernel guess (30-40% off ground truth)
         init_guess = {
             "S0_ref": 0.42,
             "alpha": 0.85,
@@ -822,7 +1098,6 @@ with tab3:
         elapsed = time.time() - t_start
         prog_bar.progress(1.0, text=f"3-Stage Curriculum Completed in {elapsed:.1f} s!")
 
-        # Evaluate dense PINN predictions and Fisher Information Correlation Matrix
         with torch.no_grad():
             t_dense_th = torch.tensor(sim_data["t"][:, None], dtype=torch.float32)
             w_m_pinn, w_t_pinn, T_m_pinn, T_t_pinn = pinn_net(t_dense_th)
@@ -847,7 +1122,6 @@ with tab3:
 
     if "pinn_results" in st.session_state:
         res = st.session_state["pinn_results"]
-        # Parameter Recovery Comparison Table
         rows_comp = []
         for k in ["S0_ref", "alpha", "phi", "gamma", "beta", "nu_mu", "kappa_A"]:
             t_val = true_params_dict[k]
@@ -914,13 +1188,11 @@ with tab4:
                 "PINN Reconstructed Mill & Tank Temperatures (°C)",
             ),
         )
-        # Left: D90 Deconvolution
         fig_diag.add_trace(go.Scatter(x=df_obs["time_min"], y=d90_obs, mode="markers", name="Noisy Tank Samples D90", marker=dict(size=9, color="#1f77b4", symbol="circle-open", line=dict(width=2))), row=1, col=1)
         fig_diag.add_trace(go.Scatter(x=sim_data["t"], y=d90_t_p, name="PINN Tank D90_t(t)", line=dict(color="#1f77b4", width=3)), row=1, col=1)
         fig_diag.add_trace(go.Scatter(x=sim_data["t"], y=sim_data["d90_m"], name="True Latent Mill D90_m(t)", line=dict(color="black", width=2, dash="dot")), row=1, col=1)
         fig_diag.add_trace(go.Scatter(x=sim_data["t"], y=d90_m_p, name="PINN Deconvolved Mill D90_m(t)", line=dict(color="#ff7f0e", width=3, dash="dash")), row=1, col=1)
 
-        # Right: Temperatures
         fig_diag.add_trace(go.Scatter(x=df_obs["time_min"], y=df_obs["T_tank_K"] - 273.15, mode="markers", name="Noisy Tank T_t Samples", marker=dict(size=8, color="#1f77b4")), row=1, col=2)
         fig_diag.add_trace(go.Scatter(x=sim_data["t"], y=res["T_t_pinn"] - 273.15, name="PINN Tank T_t(t)", line=dict(color="#1f77b4", width=2.5)), row=1, col=2)
         fig_diag.add_trace(go.Scatter(x=sim_data["t"], y=sim_data["T_m"] - 273.15, name="True Mill T_m(t)", line=dict(color="black", width=2, dash="dot")), row=1, col=2)
@@ -932,3 +1204,475 @@ with tab4:
         fig_diag.update_yaxes(title_text="Temperature (°C)", row=1, col=2)
         fig_diag.update_layout(height=450, template="plotly_white", legend=dict(orientation="h", y=-0.18))
         st.plotly_chart(fig_diag, use_container_width=True)
+
+# ---------------------------------------------------------------------
+# TAB 5: NETZSCH DELTAVITA (DV200/300/600/2000), CHAMBER & KWADE OPTIMIZER
+# ---------------------------------------------------------------------
+with tab5:
+    st.subheader("🚀 NETZSCH DeltaVita® (DV 200 / DV 300 / DV 600 / DV 2000) Scale-Up, Material & Kwade Optimizer")
+
+    if "pinn_results" in st.session_state:
+        base_k_params = st.session_state["pinn_results"]["learned_params"]
+        st.success(
+            f"✅ **Active Kernel Source:** Using **PINN-Identified Thermo-Viscous Parameters** from `{lab_model_key}` "
+            f"(S0_ref = {base_k_params['S0_ref']:.3f} min⁻¹, α = {base_k_params['alpha']:.2f}, "
+            f"γ = {base_k_params['gamma']:.2f}, ν_μ = {base_k_params['nu_mu']:.2f}, κ_A = {base_k_params['kappa_A']:.2f})."
+        )
+    else:
+        base_k_params = true_params_dict
+        st.info(
+            f"ℹ️ **Active Kernel Source:** Using baseline parameters from `{lab_model_key}`. "
+            "Run Tab 3 to lock onto inverse PINN parameters learned from noisy tank data."
+        )
+
+    # 1. Target NETZSCH Model, Chamber Material (SS vs Ceramic) & Bead Material Selector
+    with st.expander("🏭 1. Select Target NETZSCH DeltaVita® Model, Chamber Liner (SS vs. Ceramic) & Bead Media", expanded=True):
+        m_c1, m_c2, m_c3 = st.columns(3)
+        target_model_key = m_c1.selectbox(
+            "Target NETZSCH DeltaVita® Model",
+            options=list(NETZSCH_DELTAVITA_MODELS.keys()),
+            index=3,  # Default: DV 2000 (2.00 L GMP Production)
+        )
+        target_chamber_key = m_c2.selectbox(
+            "Target Grinding Chamber Material (SS vs. Ceramic)",
+            options=list(CHAMBER_LINER_MATERIALS.keys()),
+            index=0,  # Default: Stainless Steel 316L
+        )
+        target_bead_key = m_c3.selectbox(
+            "Target Grinding Bead Material (Zirconium vs. Ceramic)",
+            options=list(BEAD_MEDIA_TYPES.keys()),
+            index=0,  # Default: VitaBeaDs NaNo (Y-ZrO2)
+        )
+
+        t_model_spec = NETZSCH_DELTAVITA_MODELS[target_model_key]
+        t_chamber_spec = CHAMBER_LINER_MATERIALS[target_chamber_key]
+        t_bead_spec = BEAD_MEDIA_TYPES[target_bead_key]
+        UA_m_target, UA_t_target, U_m_target = compute_netzsch_chamber_ua(target_model_key, target_chamber_key)
+
+        c_su1, c_su2, c_su3, c_su4 = st.columns(4)
+        V_m_pilot = c_su1.number_input("Target Chamber Volume V_m (L)", 0.10, 20.0, float(t_model_spec["V_m"]), 0.10)
+        V_t_pilot = c_su2.number_input("Target Holding Tank Volume V_t (L)", 0.50, 200.0, float(t_model_spec["V_t_default"]), 0.50)
+        Q_pilot = c_su3.number_input("Target Recirculation Flow Q (L/min)", 0.20, 50.0, float(t_model_spec["Q_default"]), 0.20)
+        t_max_pilot = c_su4.number_input("Batch Simulation Horizon (min)", 20.0, 360.0, 90.0, 10.0)
+
+    with st.expander("⚪ 2. Kwade Bead Diameter (d_GM), Tip Speed (v_t) & Cooling Constraints", expanded=True):
+        k_c1, k_c2, k_c3, k_c4, k_c5, k_c6 = st.columns(6)
+        d_gm_pilot_um = k_c1.slider("Bead Diameter d_GM (µm)", 100.0, 1000.0, 300.0, 25.0)
+        v_tip_pilot_ms = k_c2.slider(
+            "Agitator Tip Speed v_t (m/s)",
+            5.0, float(t_chamber_spec["max_tip_speed_ms"]), 10.5, 0.25
+        )
+        phi_gm_pilot = k_c3.slider("Bead Filling Ratio φ_GM (-)", 0.65, 0.90, 0.82, 0.01)
+        SE_opt_mJ = k_c4.number_input("API Optimal SE_opt (mJ)", 0.005, 1.500, 0.035, 0.005, format="%.3f")
+        d90_spec_um = k_c5.slider("Target Product D90 (µm)", 0.20, 3.00, 0.55, 0.05)
+        T_max_limit_C = k_c6.slider("Max Slurry Temp Limit (°C)", 25.0, 55.0, 35.0, 1.0)
+
+        T_cool_pilot_C = 12.0  # Chiller coolant supply temp (°C)
+        max_supp_UA = 150.0    # Available supplemental trim heat exchanger conductance (W/K)
+
+    # 2. Evaluate Kwade Stress Energy & Power Scaling for Selected NETZSCH Model + Bead Type
+    kwade_res = compute_kwade_stress_scaling(
+        d_gm_um=d_gm_pilot_um,
+        v_tip_ms=v_tip_pilot_ms,
+        phi_gm=phi_gm_pilot,
+        rho_gm_kgm3=t_bead_spec["rho_kgm3"],
+        SE_opt_mJ=SE_opt_mJ,
+        d_gm_lab_um=400.0,
+        v_tip_lab_ms=10.0,
+        phi_gm_lab=0.80,
+        rho_gm_lab_kgm3=lab_b_spec["rho_kgm3"],
+    )
+
+    P_pilot_W = t_model_spec["P_agit_W"] * (V_m_pilot / t_model_spec["V_m"]) * kwade_res["power_density_ratio"]
+    pilot_k_params = {
+        **base_k_params,
+        "S0_ref": base_k_params["S0_ref"] * kwade_res["S0_multiplier"],
+    }
+
+    UA_tank_scaled = UA_t_target * ((V_t_pilot / t_model_spec["V_t_default"]) ** (2.0 / 3.0))
+
+    pilot_selected_cfg = MillLoopConfig(
+        V_m=V_m_pilot,
+        V_t=V_t_pilot,
+        Q=Q_pilot,
+        t_max=t_max_pilot,
+        P_agit_W=P_pilot_W,
+        UA_mill=UA_m_target,
+        UA_tank=UA_tank_scaled,
+        T_cool_m=273.15 + T_cool_pilot_C,
+        T_cool_t=273.15 + T_cool_pilot_C + 2.0,
+        phi_v=cfg.phi_v,
+    )
+
+    t_pilot_grid = np.linspace(0.0, t_max_pilot, 241)
+    sim_selected = simulate_coupled_mill_tank_loop(pilot_selected_cfg, pilot_k_params, w0_vec, t_pilot_grid)
+    therm_selected = compute_thermal_and_energy_metrics(pilot_selected_cfg, sim_selected)
+    cooling_sol = solve_required_pilot_cooling(
+        pilot_selected_cfg, pilot_k_params, w0_vec, t_pilot_grid, 273.15 + T_max_limit_C
+    )
+
+    # Simulate All 4 Chamber Liner Options on the Selected NETZSCH Model for Direct Comparison
+    chamber_comp_traces = {}
+    for ch_name in CHAMBER_LINER_MATERIALS.keys():
+        ua_m_ch, ua_t_ch, u_coeff_ch = compute_netzsch_chamber_ua(target_model_key, ch_name)
+        ch_cfg = MillLoopConfig(
+            **{
+                **pilot_selected_cfg.__dict__,
+                "UA_mill": ua_m_ch,
+                "UA_tank": ua_t_ch * ((V_t_pilot / t_model_spec["V_t_default"]) ** (2.0 / 3.0)),
+            }
+        )
+        sim_ch = simulate_coupled_mill_tank_loop(ch_cfg, pilot_k_params, w0_vec, t_pilot_grid)
+        chamber_comp_traces[ch_name] = {
+            "sim": sim_ch,
+            "UA_mill": ua_m_ch,
+            "U_coeff": u_coeff_ch,
+        }
+
+    def get_batch_endpoint_and_wear(t_arr, d90_arr, E_arr, target_d90, bead_spec, chamber_spec, se_ratio):
+        wear_rate_factor = (
+            bead_spec["base_wear_ppm_per_kWh_kg"]
+            * chamber_spec["wear_factor"]
+            * (max(se_ratio, 0.2) ** 0.65)
+        )
+        wear_traj_ppm = E_arr * wear_rate_factor
+
+        idx = np.where(d90_arr <= target_d90)[0]
+        if len(idx) == 0:
+            return None, None, float(wear_traj_ppm[-1]), wear_traj_ppm
+        i = idx[0]
+        if i == 0:
+            return float(t_arr[0]), float(E_arr[0]), float(wear_traj_ppm[0]), wear_traj_ppm
+        frac = (target_d90 - d90_arr[i - 1]) / (d90_arr[i] - d90_arr[i - 1] - 1e-12)
+        t_hit = float(t_arr[i - 1] + frac * (t_arr[i] - t_arr[i - 1]))
+        e_hit = float(E_arr[i - 1] + frac * (E_arr[i] - E_arr[i - 1]))
+        w_hit = float(wear_traj_ppm[i - 1] + frac * (wear_traj_ppm[i] - wear_traj_ppm[i - 1]))
+        return t_hit, e_hit, w_hit, wear_traj_ppm
+
+    t_hit_sel, E_hit_sel, wear_hit_ppm, wear_traj_sel = get_batch_endpoint_and_wear(
+        sim_selected["t"],
+        sim_selected["d90_t"],
+        therm_selected["E_specific_kWh_kg"],
+        d90_spec_um,
+        t_bead_spec,
+        t_chamber_spec,
+        kwade_res["SE_ratio_to_opt"],
+    )
+
+    # 3. KPI Summary Cards for Selected NETZSCH Configuration
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric(
+        "Chamber Conductance UA_m",
+        f"{UA_m_target:.1f} W/K",
+        f"U_m = {U_m_target:.0f} W/(m²·K) ({t_chamber_spec['family']})",
+    )
+    k2.metric(
+        "Bead Stress Energy SE_GM",
+        f"{kwade_res['SE_pilot_mJ']:.4f} mJ",
+        f"{kwade_res['SE_ratio_to_opt']:.2f}x SE_opt ({t_bead_spec['category']})",
+    )
+    k3.metric(
+        f"Batch Time to {d90_spec_um:.2f} µm",
+        f"{t_hit_sel:.1f} min" if t_hit_sel else "> Horizon",
+        f"E_m = {E_hit_sel:.3f} kWh/kg" if E_hit_sel else "Increase horizon",
+    )
+    k4.metric(
+        "Peak Mill Temp T_m",
+        f"{cooling_sol['peak_T_geom_C']:.1f} °C",
+        f"{cooling_sol['peak_T_geom_C'] - T_max_limit_C:+.1f} °C vs Limit",
+        delta_color="inverse",
+    )
+    k5.metric(
+        "Supplemental HX Needed",
+        f"{cooling_sol['UA_supplemental_HX']:.1f} W/K",
+        "Jacket Only OK" if not cooling_sol["needs_supplemental_cooling"] else "External Trim HX Req.",
+        delta_color="normal" if not cooling_sol["needs_supplemental_cooling"] else "inverse",
+    )
+    k6.metric(
+        f"Est. Media Wear ({t_bead_spec['contaminant_label']})",
+        f"{wear_hit_ppm:.1f} ppm",
+        "Metal-Free Liner" if t_chamber_spec["metal_free"] else "SS Liner (Fe/Cr/Ni)",
+    )
+
+    # 4. Automated 2D Response-Surface Grid Optimizer over (d_GM, v_t) for Selected NETZSCH Model
+    d_grid = np.linspace(150.0, 900.0, 11)
+    v_grid = np.linspace(6.0, float(t_chamber_spec["max_tip_speed_ms"]), 10)
+    t_batch_surf = np.full((len(v_grid), len(d_grid)), np.nan)
+    T_peak_surf = np.zeros((len(v_grid), len(d_grid)))
+
+    ref_time = t_hit_sel if t_hit_sel is not None else t_max_pilot * 1.25
+    ref_S0_mult = max(kwade_res["S0_multiplier"], 1e-4)
+    UA_total_avail = UA_m_target + max_supp_UA + UA_tank_scaled * 0.65
+
+    opt_records = []
+    for i_v, vt_val in enumerate(v_grid):
+        for j_d, dg_val in enumerate(d_grid):
+            kw_ij = compute_kwade_stress_scaling(
+                dg_val, vt_val, phi_gm_pilot, t_bead_spec["rho_kgm3"], SE_opt_mJ,
+                400.0, 10.0, 0.80, lab_b_spec["rho_kgm3"]
+            )
+            P_ij_W = t_model_spec["P_agit_W"] * (V_m_pilot / t_model_spec["V_m"]) * kw_ij["power_density_ratio"]
+            T_peak_ij_C = (
+                T_cool_pilot_C
+                + (cfg.eta_diss * P_ij_W * 1.12) / max(UA_total_avail, 1.0)
+            )
+            T_peak_surf[i_v, j_d] = T_peak_ij_C
+
+            t_est_min = ref_time * (ref_S0_mult / max(kw_ij["S0_multiplier"], 1e-4)) ** 0.88
+            t_batch_surf[i_v, j_d] = min(t_est_min, t_max_pilot * 1.5)
+
+            solids_kg = (cfg.rho_slurry / 1000.0) * (V_m_pilot + V_t_pilot) * 0.24
+            E_est_kWh_kg = (P_ij_W / 1000.0) * (t_est_min / 60.0) / max(solids_kg, 1e-6)
+            wear_est_ppm = (
+                E_est_kWh_kg
+                * t_bead_spec["base_wear_ppm_per_kWh_kg"]
+                * t_chamber_spec["wear_factor"]
+                * (max(kw_ij["SE_ratio_to_opt"], 0.2) ** 0.65)
+            )
+
+            feasible = (T_peak_ij_C <= T_max_limit_C) and (t_est_min <= t_max_pilot)
+            opt_records.append({
+                "d_GM_um": dg_val,
+                "v_tip_ms": vt_val,
+                "SE_GM_mJ": kw_ij["SE_pilot_mJ"],
+                "eta_SE_pct": kw_ij["eta_pilot"] * 100.0,
+                "P_shaft_kW": P_ij_W / 1000.0,
+                "T_peak_mitigated_C": T_peak_ij_C,
+                "Batch_Time_min": t_est_min,
+                "Specific_Energy_kWh_kg": E_est_kWh_kg,
+                "Media_Wear_ppm": wear_est_ppm,
+                "Thermally_Feasible": feasible,
+            })
+
+    df_opt_grid = pd.DataFrame(opt_records)
+    df_feas = df_opt_grid[df_opt_grid["Thermally_Feasible"]]
+    best_row = (
+        df_feas.loc[df_feas["Batch_Time_min"].idxmin()]
+        if len(df_feas) > 0
+        else df_opt_grid.loc[df_opt_grid["Specific_Energy_kWh_kg"].idxmin()]
+    )
+
+    st.info(
+        f"🎯 **Kwade Optimum on `{target_model_key[:7]}` ({t_chamber_spec['family']} + {t_bead_spec['category']} Beads):** "
+        f"Optimal Bead Diameter **d_GM* = {best_row['d_GM_um']:.0f} µm**, "
+        f"Optimal Tip Speed **v_t* = {best_row['v_tip_ms']:.1f} m/s** "
+        f"(Stress Energy **SE_GM = {best_row['SE_GM_mJ']:.4f} mJ**, Efficiency **η_SE = {best_row['eta_SE_pct']:.1f}%**) "
+        f"➔ Minimum Batch Time = **{best_row['Batch_Time_min']:.1f} min**, "
+        f"Est. Wear = **{best_row['Media_Wear_ppm']:.1f} ppm**."
+    )
+
+    # 5. Four-Panel Interactive Comparison & Kwade Optimization Dashboard
+    fig_ndv = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=(
+            f"1. Chamber Liner Comparison on {target_model_key[:7]}: Mill Temp T_m(t)",
+            f"2. Chamber Liner Effect on Holding Tank D90(t) (Target = {d90_spec_um} µm)",
+            "3. Zirconium vs. Ceramic Bead Media: Batch Time & Wear (ppm)",
+            f"4. Kwade 2D Optimization Surface: Batch Time (min) & T_max={T_max_limit_C:.0f}°C Limit",
+        ),
+        specs=[[{}, {}], [{"secondary_y": True}, {}]],
+        vertical_spacing=0.15,
+        horizontal_spacing=0.11,
+    )
+
+    ch_colors = {
+        "Stainless Steel (AISI 316L Pharma Ra <= 0.4 um)": "#1f77b4",
+        "Ceramic - NETZSCH-Ceram C (Sintered SiC)": "#2ca02c",
+        "Ceramic - NETZSCH-Ceram N (Silicon Nitride Si3N4)": "#9467bd",
+        "Ceramic - NETZSCH-Ceram Z (Zirconia ZrO2)": "#d62728",
+    }
+
+    for ch_name, ch_data in chamber_comp_traces.items():
+        short_lbl = ch_name.split(" (")[0] + f" (UA={ch_data['UA_mill']:.0f} W/K)"
+        is_active = ch_name == target_chamber_key
+        fig_ndv.add_trace(
+            go.Scatter(
+                x=ch_data["sim"]["t"],
+                y=ch_data["sim"]["T_m"] - 273.15,
+                name=short_lbl,
+                line=dict(color=ch_colors[ch_name], width=3.5 if is_active else 2.0, dash="solid" if is_active else "dash"),
+            ),
+            row=1, col=1,
+        )
+        fig_ndv.add_trace(
+            go.Scatter(
+                x=ch_data["sim"]["t"],
+                y=ch_data["sim"]["d90_t"],
+                name=short_lbl,
+                showlegend=False,
+                line=dict(color=ch_colors[ch_name], width=3.5 if is_active else 2.0, dash="solid" if is_active else "dash"),
+            ),
+            row=1, col=2,
+        )
+
+    fig_ndv.add_hline(y=T_max_limit_C, line_dash="dot", line_color="red", annotation_text=f"T_max = {T_max_limit_C:.0f} °C", row=1, col=1)
+    fig_ndv.add_hline(y=d90_spec_um, line_dash="dot", line_color="black", annotation_text=f"Target D90 = {d90_spec_um} µm", row=1, col=2)
+
+    # Panel (2,1): Compare All 5 Zirconium & Ceramic Bead Types
+    bead_names_short, bead_t_batch, bead_wear_vals = [], [], []
+    for b_name, b_info in BEAD_MEDIA_TYPES.items():
+        kw_b = compute_kwade_stress_scaling(
+            d_gm_pilot_um, v_tip_pilot_ms, phi_gm_pilot, b_info["rho_kgm3"], SE_opt_mJ,
+            400.0, 10.0, 0.80, lab_b_spec["rho_kgm3"]
+        )
+        t_est_b = (t_hit_sel if t_hit_sel else t_max_pilot) * (
+            max(kwade_res["S0_multiplier"], 1e-4) / max(kw_b["S0_multiplier"], 1e-4)
+        ) ** 0.88
+        E_est_b = (E_hit_sel if E_hit_sel else 0.15) * (kw_b["eta_lab"] / max(kw_b["eta_pilot"], 1e-3))
+        wear_b = (
+            E_est_b
+            * b_info["base_wear_ppm_per_kWh_kg"]
+            * t_chamber_spec["wear_factor"]
+            * (max(kw_b["SE_ratio_to_opt"], 0.2) ** 0.65)
+        )
+        bead_names_short.append(b_name.split(" (")[0].replace("Zirconium Oxide - ", "Zr: ").replace("Ceramic - ", "Cer: "))
+        bead_t_batch.append(float(t_est_b))
+        bead_wear_vals.append(float(wear_b))
+
+    fig_ndv.add_trace(
+        go.Bar(x=bead_names_short, y=bead_t_batch, name="Predicted Batch Time (min)", marker_color="#1f77b4", opacity=0.85),
+        row=2, col=1, secondary_y=False,
+    )
+    fig_ndv.add_trace(
+        go.Scatter(x=bead_names_short, y=bead_wear_vals, name="Predicted Media Wear (ppm)", mode="lines+markers", marker=dict(size=10, color="#d62728"), line=dict(width=3, color="#d62728")),
+        row=2, col=1, secondary_y=True,
+    )
+
+    # Panel (2,2): 2D Contour Map of Batch Time over (d_GM, v_t) + Thermal Limit Boundary
+    fig_ndv.add_trace(
+        go.Contour(
+            x=d_grid,
+            y=v_grid,
+            z=t_batch_surf,
+            colorscale="Viridis_r",
+            showscale=False,
+            contours=dict(showlabels=True, labelfont=dict(size=10, color="white")),
+            name="Batch Time (min)",
+        ),
+        row=2, col=2,
+    )
+    fig_ndv.add_trace(
+        go.Contour(
+            x=d_grid,
+            y=v_grid,
+            z=T_peak_surf,
+            showscale=False,
+            contours=dict(coloring="none", start=T_max_limit_C, end=T_max_limit_C, size=1.0, showlabels=True),
+            line=dict(color="#ff2b2b", width=3, dash="dash"),
+            name=f"Max Temp Limit ({T_max_limit_C:.0f} °C)",
+        ),
+        row=2, col=2,
+    )
+    fig_ndv.add_trace(
+        go.Scatter(
+            x=[d_gm_pilot_um], y=[v_tip_pilot_ms], mode="markers+text", text=["Current"], textposition="top right",
+            marker=dict(size=11, color="white", symbol="circle", line=dict(width=3, color="black")),
+            name="Selected (d_GM, v_t)",
+        ),
+        row=2, col=2,
+    )
+    fig_ndv.add_trace(
+        go.Scatter(
+            x=[best_row["d_GM_um"]], y=[best_row["v_tip_ms"]], mode="markers+text", text=["Optimum*"], textposition="bottom left",
+            marker=dict(size=14, color="#00ff88", symbol="star", line=dict(width=2, color="black")),
+            name="Kwade Optimum (d_GM*, v_t*)",
+        ),
+        row=2, col=2,
+    )
+
+    fig_ndv.update_xaxes(title_text="Batch Time (min)", row=1, col=1)
+    fig_ndv.update_yaxes(title_text="Mill Slurry Temp T_m (°C)", row=1, col=1)
+    fig_ndv.update_xaxes(title_text="Batch Time (min)", row=1, col=2)
+    fig_ndv.update_yaxes(title_text="Holding Tank D90 (µm)", row=1, col=2)
+    fig_ndv.update_yaxes(title_text="Batch Time (min)", row=2, col=1, secondary_y=False)
+    fig_ndv.update_yaxes(title_text="Wear Contamination (ppm)", row=2, col=1, secondary_y=True)
+    fig_ndv.update_xaxes(title_text="Bead Diameter d_GM (µm)", row=2, col=2)
+    fig_ndv.update_yaxes(title_text="Agitator Tip Speed v_t (m/s)", row=2, col=2)
+    fig_ndv.update_layout(height=780, template="plotly_white", legend=dict(orientation="h", y=-0.14))
+    st.plotly_chart(fig_ndv, use_container_width=True)
+
+    # 6. Full NETZSCH DeltaVita Fleet Comparison Matrix (DV 200 vs DV 300 vs DV 600 vs DV 2000)
+    st.markdown("#### 📋 NETZSCH DeltaVita® Fleet Scale-Up Matrix (DV 200 ➔ DV 300 ➔ DV 600 ➔ DV 2000)")
+    fleet_rows = []
+    for m_name, m_info in NETZSCH_DELTAVITA_MODELS.items():
+        ua_m_ss, ua_t_ss, _ = compute_netzsch_chamber_ua(
+            m_name, "Stainless Steel (AISI 316L Pharma Ra <= 0.4 um)"
+        )
+        ua_m_sic, _, _ = compute_netzsch_chamber_ua(
+            m_name, "Ceramic - NETZSCH-Ceram C (Sintered SiC)"
+        )
+        ua_m_zro2, _, _ = compute_netzsch_chamber_ua(
+            m_name, "Ceramic - NETZSCH-Ceram Z (Zirconia ZrO2)"
+        )
+        ua_m_sel, ua_t_sel, _ = compute_netzsch_chamber_ua(m_name, target_chamber_key)
+
+        P_m_W = m_info["P_agit_W"] * kwade_res["power_density_ratio"]
+        f_cfg = MillLoopConfig(
+            V_m=m_info["V_m"],
+            V_t=m_info["V_t_default"],
+            Q=m_info["Q_default"],
+            t_max=t_max_pilot,
+            P_agit_W=P_m_W,
+            UA_mill=ua_m_sel,
+            UA_tank=ua_t_sel,
+            T_cool_m=273.15 + T_cool_pilot_C,
+            T_cool_t=273.15 + T_cool_pilot_C + 2.0,
+            phi_v=cfg.phi_v,
+        )
+        sim_f = simulate_coupled_mill_tank_loop(f_cfg, pilot_k_params, w0_vec, t_pilot_grid)
+        therm_f = compute_thermal_and_energy_metrics(f_cfg, sim_f)
+        t_f, e_f, w_f, _ = get_batch_endpoint_and_wear(
+            sim_f["t"], sim_f["d90_t"], therm_f["E_specific_kWh_kg"],
+            d90_spec_um, t_bead_spec, t_chamber_spec, kwade_res["SE_ratio_to_opt"]
+        )
+
+        fleet_rows.append({
+            "NETZSCH Model": m_name,
+            "V_m (L)": m_info["V_m"],
+            "Default Batch V_t (L)": m_info["V_t_default"],
+            "Flow Q (L/min)": m_info["Q_default"],
+            "Shaft Power P_0 (kW)": P_m_W / 1000.0,
+            "UA_m [316L SS] (W/K)": ua_m_ss,
+            "UA_m [Ceram C SiC] (W/K)": ua_m_sic,
+            "UA_m [Ceram Z ZrO2] (W/K)": ua_m_zro2,
+            f"Peak T_m [{t_chamber_spec['family']}] (°C)": float(np.max(sim_f["T_m"]) - 273.15),
+            f"Time to {d90_spec_um}µm (min)": f"{t_f:.1f}" if t_f else "> Horizon",
+            "Predicted Wear (ppm)": w_f,
+        })
+
+    df_fleet = pd.DataFrame(fleet_rows)
+    st.dataframe(
+        df_fleet.style.format({
+            "V_m (L)": "{:.2f}",
+            "Default Batch V_t (L)": "{:.1f}",
+            "Flow Q (L/min)": "{:.2f}",
+            "Shaft Power P_0 (kW)": "{:.2f}",
+            "UA_m [316L SS] (W/K)": "{:.1f}",
+            "UA_m [Ceram C SiC] (W/K)": "{:.1f}",
+            "UA_m [Ceram Z ZrO2] (W/K)": "{:.1f}",
+            f"Peak T_m [{t_chamber_spec['family']}] (°C)": "{:.1f}",
+            "Predicted Wear (ppm)": "{:.1f}",
+        }),
+        use_container_width=True,
+    )
+
+    col_dl1, col_dl2 = st.columns(2)
+    fleet_csv = io.StringIO()
+    df_fleet.to_csv(fleet_csv, index=False)
+    col_dl1.download_button(
+        "📥 Download NETZSCH Fleet Scale-Up Matrix (CSV)",
+        data=fleet_csv.getvalue(),
+        file_name="netzsch_deltavita_fleet_material_scaleup.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    kw_csv = io.StringIO()
+    df_opt_grid.to_csv(kw_csv, index=False)
+    col_dl2.download_button(
+        "📥 Download Kwade (d_GM, v_t) Response Surface (CSV)",
+        data=kw_csv.getvalue(),
+        file_name="netzsch_kwade_stress_energy_surface.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
