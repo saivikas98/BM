@@ -17,7 +17,7 @@ import torch.nn.functional as F
 # PAGE CONFIGURATION
 # =====================================================================
 st.set_page_config(
-    page_title="NETZSCH DeltaVita Thermo-Viscous PBE-PINN & 3D Digital Twin",
+    page_title="NETZSCH DeltaVita Thermo-Viscous PBE-PINN & 3D Loop Digital Twin",
     page_icon="⚙️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -88,15 +88,15 @@ NETZSCH_DELTAVITA_MODELS = {
 CHAMBER_LINER_MATERIALS = {
     "Stainless Steel (AISI 316L Pharma Ra <= 0.4 um)": {
         "family": "Stainless Steel",
-        "k_wall_WmK": 16.2,       # Thermal conductivity W/(m*K)
-        "wear_factor": 1.45,      # Relative liner wear multiplier (Fe/Cr/Ni shedding)
+        "k_wall_WmK": 16.2,
+        "wear_factor": 1.45,
         "metal_free": False,
         "max_tip_speed_ms": 14.0,
         "shell_color": "#7f8c8d",
     },
     "Ceramic - NETZSCH-Ceram C (Sintered SiC)": {
         "family": "Ceramic (SiC)",
-        "k_wall_WmK": 110.0,      # High-conductivity silicon carbide ceramic
+        "k_wall_WmK": 110.0,
         "wear_factor": 0.65,
         "metal_free": True,
         "max_tip_speed_ms": 16.0,
@@ -104,7 +104,7 @@ CHAMBER_LINER_MATERIALS = {
     },
     "Ceramic - NETZSCH-Ceram N (Silicon Nitride Si3N4)": {
         "family": "Ceramic (Si3N4)",
-        "k_wall_WmK": 28.0,       # High fracture-toughness silicon nitride ceramic
+        "k_wall_WmK": 28.0,
         "wear_factor": 0.75,
         "metal_free": True,
         "max_tip_speed_ms": 15.5,
@@ -112,7 +112,7 @@ CHAMBER_LINER_MATERIALS = {
     },
     "Ceramic - NETZSCH-Ceram Z (Zirconia ZrO2)": {
         "family": "Ceramic (ZrO2)",
-        "k_wall_WmK": 2.2,        # Insulating monolithic zirconia ceramic
+        "k_wall_WmK": 2.2,
         "wear_factor": 0.85,
         "metal_free": True,
         "max_tip_speed_ms": 13.0,
@@ -184,12 +184,10 @@ def get_const_dict() -> Dict[str, float]:
 
 
 def rpm_to_tip_speed(rpm: float, d_rotor_mm: float) -> float:
-    """Converts agitator shaft RPM to peripheral tip speed v_t (m/s)."""
     return float((np.pi * (d_rotor_mm * 1e-3) * rpm) / 60.0)
 
 
 def tip_speed_to_rpm(v_tip_ms: float, d_rotor_mm: float) -> float:
-    """Converts peripheral tip speed v_t (m/s) to agitator shaft RPM."""
     return float((60.0 * v_tip_ms) / (np.pi * max(d_rotor_mm * 1e-3, 1e-6)))
 
 
@@ -200,10 +198,6 @@ def compute_netzsch_chamber_ua(
     h_coolant_Wm2K: float = 2200.0,
     U_tank_Wm2K: float = 380.0,
 ) -> Tuple[float, float, float]:
-    """
-    Computes physical Mill Jacket Conductance UA_mill (W/K), Tank Jacket UA_tank (W/K),
-    and Overall Mill Heat Transfer Coefficient U_mill (W/(m^2*K)) from liner thermal conductivity.
-    """
     m_spec = NETZSCH_DELTAVITA_MODELS[model_key]
     c_spec = CHAMBER_LINER_MATERIALS[chamber_key]
 
@@ -272,25 +266,69 @@ class MillLoopConfig:
 
 
 # =====================================================================
-# 3. 3D DIGITAL TWIN VISUALIZER OF NETZSCH DELTAVITA BEAD MILL
+# 3. 3D CAD DIGITAL TWIN OF COMPLETE RECIRCULATION LOOP & MILL CHAMBER
 # =====================================================================
-def build_3d_bead_mill_digital_twin(
+def _generate_3d_tube_mesh(
+    path_xyz: np.ndarray, radius: float, n_circ: int = 14
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Generates a 3D cylindrical surface mesh along an arbitrary 3D polyline path_xyz (M, 3)."""
+    M = path_xyz.shape[0]
+    theta = np.linspace(0.0, 2.0 * np.pi, n_circ)
+    X_tube = np.zeros((M, n_circ))
+    Y_tube = np.zeros((M, n_circ))
+    Z_tube = np.zeros((M, n_circ))
+
+    for i in range(M):
+        if i == 0:
+            tang = path_xyz[1] - path_xyz[0]
+        elif i == M - 1:
+            tang = path_xyz[-1] - path_xyz[-2]
+        else:
+            tang = path_xyz[i + 1] - path_xyz[i - 1]
+        tang_norm = np.linalg.norm(tang)
+        t_vec = tang / max(tang_norm, 1e-9)
+
+        # Construct orthonormal frame (n_vec, b_vec) perpendicular to t_vec
+        ref = np.array([0.0, 0.0, 1.0]) if abs(t_vec[2]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        n_vec = np.cross(t_vec, ref)
+        n_vec /= max(np.linalg.norm(n_vec), 1e-9)
+        b_vec = np.cross(t_vec, n_vec)
+
+        circle_pts = (
+            path_xyz[i, None, :]
+            + radius * np.cos(theta)[:, None] * n_vec[None, :]
+            + radius * np.sin(theta)[:, None] * b_vec[None, :]
+        )
+        X_tube[i, :] = circle_pts[:, 0]
+        Y_tube[i, :] = circle_pts[:, 1]
+        Z_tube[i, :] = circle_pts[:, 2]
+
+    return X_tube, Y_tube, Z_tube
+
+
+def build_3d_recirculation_loop_digital_twin(
     model_key: str,
     chamber_key: str,
     bead_key: str,
     rpm: float,
     d_gm_um: float,
     phi_gm: float,
-    T_inlet_C: float,
-    T_outlet_C: float,
+    Q_flow_Lmin: float,
+    T_tank_C: float,
+    T_mill_C: float,
     T_cool_C: float,
+    d90_tank_um: float,
+    d90_mill_um: float,
     SE_max_mJ: float,
     color_mode: str = "Local Stress Energy SE_GM (mJ)",
+    view_scope: str = "Full Recirculation Loop (Tank + Pump + HX + Mill)",
 ) -> go.Figure:
     """
-    Constructs an interactive 3D CAD-style WebGL Digital Twin of the horizontal
-    NETZSCH DeltaVita grinding chamber, cooling jacket, rotor shaft, pin-discs,
-    dynamic separation screen, and 360+ spatially distributed grinding beads.
+    Constructs an interactive 3D WebGL Digital Twin of either:
+      (A) The complete closed-loop recirculation skid: Jacketed Holding Tank (with mixer),
+          Peristaltic/Lobe Feed Pump, Sanitary Feed/Return Piping, In-Line Trim Heat Exchanger,
+          and NETZSCH DeltaVita Grinding Chamber, OR
+      (B) High-detail close-up of the NETZSCH DeltaVita Grinding Chamber alone.
     """
     m_spec = NETZSCH_DELTAVITA_MODELS[model_key]
     c_spec = CHAMBER_LINER_MATERIALS[chamber_key]
@@ -303,111 +341,112 @@ def build_3d_bead_mill_digital_twin(
     n_discs = m_spec["n_discs"]
 
     fig = go.Figure()
-
-    # 1. Outer Cooling Jacket Shell (Translucent Blue Cylinder)
-    theta_grid = np.linspace(0, 2 * np.pi, 44)
-    x_cyl = np.linspace(0, L, 24)
+    theta_grid = np.linspace(0, 2 * np.pi, 40)
+    x_cyl = np.linspace(0, L, 22)
     Theta, X_c = np.meshgrid(theta_grid, x_cyl)
 
-    Y_jack = R_jacket * np.cos(Theta)
-    Z_jack = R_jacket * np.sin(Theta)
+    # -----------------------------------------------------------------
+    # PART 1: NETZSCH DELTAVITA HORIZONTAL GRINDING CHAMBER (x in [0, L])
+    # -----------------------------------------------------------------
+    # 1a. Outer Cooling Jacket Shell
     fig.add_trace(
         go.Surface(
-            x=X_c, y=Y_jack, z=Z_jack,
+            x=X_c,
+            y=R_jacket * np.cos(Theta),
+            z=R_jacket * np.sin(Theta),
             surfacecolor=np.full_like(X_c, T_cool_C),
             colorscale=[[0, "#00b4d8"], [1, "#0077b6"]],
             showscale=False,
-            opacity=0.14,
-            name=f"Cooling Jacket ({T_cool_C:.1f} °C)",
+            opacity=0.15,
+            name=f"Mill Cooling Jacket ({T_cool_C:.1f} °C)",
             hoverinfo="name",
         )
     )
 
-    # 2. Grinding Chamber Liner Wall (Colored by Axial Slurry Temperature Profile T(x))
-    Y_ch = R_ch * np.cos(Theta)
-    Z_ch = R_ch * np.sin(Theta)
-    T_axial_field = T_inlet_C + (T_outlet_C - T_inlet_C) * (X_c / L) ** 0.75
+    # 1b. Grinding Chamber Liner Wall
+    T_axial_field = T_tank_C + (T_mill_C - T_tank_C) * (X_c / L) ** 0.75
     fig.add_trace(
         go.Surface(
-            x=X_c, y=Y_ch, z=Z_ch,
+            x=X_c,
+            y=R_ch * np.cos(Theta),
+            z=R_ch * np.sin(Theta),
             surfacecolor=T_axial_field,
             colorscale="Inferno",
             showscale=False,
-            opacity=0.26,
-            name=f"Liner: {c_spec['family']}",
-            hovertemplate="Axial Pos x: %{x:.1f} mm<br>Wall Temp: %{surfacecolor:.1f} °C<extra>Chamber Liner</extra>",
+            opacity=0.28,
+            name=f"Mill Liner: {c_spec['family']}",
+            hovertemplate="Mill Axial x: %{x:.1f} mm<br>Liner Temp: %{surfacecolor:.1f} °C<extra>Mill Chamber</extra>",
         )
     )
 
-    # 3. Central Agitator Rotor Shaft (Solid Metallic Cylinder)
-    Y_sh = R_shaft * np.cos(Theta)
-    Z_sh = R_shaft * np.sin(Theta)
+    # 1c. Central Agitator Rotor Shaft
     fig.add_trace(
         go.Surface(
-            x=X_c, y=Y_sh, z=Z_sh,
+            x=X_c,
+            y=R_shaft * np.cos(Theta),
+            z=R_shaft * np.sin(Theta),
             colorscale=[[0, "#576574"], [1, "#8395a7"]],
             showscale=False,
             opacity=0.95,
-            name=f"Agitator Shaft ({rpm:.0f} RPM)",
+            name=f"Mill Rotor Shaft ({rpm:.0f} RPM)",
             hoverinfo="name",
         )
     )
 
-    # 4. Agitator Pin-Discs (Radial Momentum Transfer Elements along Shaft)
+    # 1d. Agitator Pin-Discs
     disc_positions = np.linspace(0.16 * L, 0.84 * L, n_discs)
-    r_disc_grid = np.linspace(R_shaft, R_rot, 8)
+    r_disc_grid = np.linspace(R_shaft, R_rot, 7)
     Theta_d, R_d = np.meshgrid(theta_grid, r_disc_grid)
     for idx_d, x_d in enumerate(disc_positions):
-        X_d = np.full_like(R_d, x_d)
-        Y_d = R_d * np.cos(Theta_d)
-        Z_d = R_d * np.sin(Theta_d)
         fig.add_trace(
             go.Surface(
-                x=X_d, y=Y_d, z=Z_d,
+                x=np.full_like(R_d, x_d),
+                y=R_d * np.cos(Theta_d),
+                z=R_d * np.sin(Theta_d),
                 colorscale=[[0, "#c8d6e5"], [1, "#ff9f43"]],
                 showscale=False,
                 opacity=0.88,
-                name=f"Agitator Disc #{idx_d+1}",
+                name="Pin-Disc Agitator Elements",
                 showlegend=(idx_d == 0),
                 hovertemplate=f"Disc #{idx_d+1} at x={x_d:.1f} mm<br>Tip Speed: {rpm_to_tip_speed(rpm, m_spec['D_rotor_mm']):.2f} m/s<extra></extra>",
             )
         )
 
-    # 5. Dynamic Cartridge Separation Screen at Mill Outlet (x = 0.88*L to 0.98*L)
-    x_scr = np.linspace(0.87 * L, 0.97 * L, 8)
+    # 1e. Dynamic Cartridge Separation Screen at Mill Outlet
+    x_scr = np.linspace(0.87 * L, 0.97 * L, 7)
     Theta_s, X_s = np.meshgrid(theta_grid, x_scr)
     R_scr = R_shaft * 1.45
     fig.add_trace(
         go.Surface(
-            x=X_s, y=R_scr * np.cos(Theta_s), z=R_scr * np.sin(Theta_s),
+            x=X_s,
+            y=R_scr * np.cos(Theta_s),
+            z=R_scr * np.sin(Theta_s),
             colorscale=[[0, "#1dd1a1"], [1, "#10ac84"]],
             showscale=False,
             opacity=0.90,
-            name="Dynamic Media Separator Screen",
+            name="Dynamic Cartridge Separator",
             hoverinfo="name",
         )
     )
 
-    # 6. 3D Grinding Bead Cloud Inside Active Annulus (N_beads proportional to filling phi_gm)
+    # 1f. 3D Grinding Bead Cloud Inside Active Mill Annulus
     rng_3d = np.random.default_rng(seed=108)
-    n_beads_viz = int(280 + 220 * (phi_gm - 0.60) / 0.30)
+    n_beads_viz = int(260 + 200 * (phi_gm - 0.60) / 0.30)
     x_beads = rng_3d.uniform(0.04 * L, 0.94 * L, n_beads_viz)
     theta_beads = rng_3d.uniform(0.0, 2.0 * np.pi, n_beads_viz)
-    # Centrifugal & shear concentration biases beads toward rotor tip radius R_rot
     r_beads = rng_3d.triangular(R_shaft * 1.12, R_rot, R_ch * 0.97, n_beads_viz)
 
     y_beads = r_beads * np.cos(theta_beads)
     z_beads = r_beads * np.sin(theta_beads)
 
-    # Compute local distance to nearest agitator disc & radial velocity profile
     dist_to_disc = np.min(np.abs(x_beads[:, None] - disc_positions[None, :]), axis=1)
     axial_decay = np.exp(-dist_to_disc / (0.12 * L))
     radial_shear = np.exp(-((r_beads - R_rot) / (0.18 * R_ch)) ** 2)
 
     local_SE_mJ = SE_max_mJ * (0.15 + 0.85 * radial_shear * (0.4 + 0.6 * axial_decay))
     local_Temp_C = (
-        T_inlet_C
-        + (T_outlet_C - T_inlet_C) * (x_beads / L) ** 0.75
+        T_tank_C
+        + (T_mill_C - T_tank_C) * (x_beads / L) ** 0.75
         + 1.8 * radial_shear
     )
 
@@ -420,7 +459,7 @@ def build_3d_bead_mill_digital_twin(
         c_title = "Temp (°C)"
         c_scale = "Turbo"
 
-    marker_px = float(np.clip(4.5 + (d_gm_um - 150.0) / 140.0, 4.5, 11.0))
+    marker_px = float(np.clip(4.0 + (d_gm_um - 150.0) / 150.0, 4.0, 10.0))
 
     fig.add_trace(
         go.Scatter3d(
@@ -428,62 +467,254 @@ def build_3d_bead_mill_digital_twin(
             y=y_beads,
             z=z_beads,
             mode="markers",
-            name=f"Grinding Beads ({bead_key[:18]}...)",
+            name=f"Grinding Beads ({bead_key[:16]}...)",
             marker=dict(
                 size=marker_px,
                 color=c_vals,
                 colorscale=c_scale,
                 opacity=0.92,
-                colorbar=dict(title=c_title, len=0.65, thickness=16, x=0.96),
-                line=dict(width=0.4, color="#222"),
+                colorbar=dict(title=c_title, len=0.62, thickness=15, x=0.97),
+                line=dict(width=0.3, color="#222"),
             ),
             customdata=np.stack([local_SE_mJ, local_Temp_C, r_beads], axis=-1),
             hovertemplate=(
                 "<b>Grinding Bead</b><br>"
-                "Axial Pos x: %{x:.1f} mm<br>"
-                "Radial Pos r: %{customdata[2]:.1f} mm<br>"
-                "Local Stress Energy: %{customdata[0]:.4f} mJ<br>"
-                "Local Slurry Temp: %{customdata[1]:.1f} °C<extra></extra>"
+                "Axial x: %{x:.1f} mm | Radial r: %{customdata[2]:.1f} mm<br>"
+                "Stress Energy: %{customdata[0]:.4f} mJ<br>"
+                "Local Temp: %{customdata[1]:.1f} °C<extra></extra>"
             ),
         )
     )
 
-    # 7. Slurry Inlet (x=0) & Product Outlet (x=L) Flow Vectors
-    fig.add_trace(
-        go.Cone(
-            x=[0.02 * L, 0.98 * L],
-            y=[0.0, 0.0],
-            z=[R_ch * 0.72, 0.0],
-            u=[0.18 * L, 0.18 * L],
-            v=[0.0, 0.0],
-            w=[-0.08 * R_ch, 0.0],
-            colorscale=[[0, "#00d2d3"], [1, "#ff6b6b"]],
-            showscale=False,
-            sizemode="absolute",
-            sizeref=0.12 * L,
-            name="Slurry Feed / Outlet Flow",
+    # -----------------------------------------------------------------
+    # PART 2: FULL RECIRCULATION SKID (HOLDING TANK + PUMP + TRIM HX + PIPING)
+    # -----------------------------------------------------------------
+    if view_scope.startswith("Full Recirculation Loop"):
+        # Position Holding Tank at (-x_tank, y_tank, z_tank) scaled proportionally to mill L
+        x_tk = -1.35 * L
+        y_tk = -1.65 * L
+        R_tk = 0.58 * L
+        R_tk_jacket = R_tk * 1.09
+        H_tk = 1.65 * L
+        z_tk_bot = -0.75 * L
+        z_tk_top = z_tk_bot + H_tk
+        z_slurry_lvl = z_tk_bot + 0.78 * H_tk
+
+        z_tank_grid = np.linspace(z_tk_bot, z_tk_top, 20)
+        Theta_tk, Z_tk = np.meshgrid(theta_grid, z_tank_grid)
+
+        # 2a. Holding Tank Outer Cooling Jacket
+        fig.add_trace(
+            go.Surface(
+                x=x_tk + R_tk_jacket * np.cos(Theta_tk),
+                y=y_tk + R_tk_jacket * np.sin(Theta_tk),
+                z=Z_tk,
+                colorscale=[[0, "#48cae4"], [1, "#0096c7"]],
+                showscale=False,
+                opacity=0.16,
+                name="Holding Tank Cooling Jacket",
+                hoverinfo="name",
+            )
         )
-    )
+
+        # 2b. Holding Tank Slurry Volume (Wetted Inner Cylinder up to 78% level)
+        z_liq_grid = np.linspace(z_tk_bot, z_slurry_lvl, 16)
+        Theta_lq, Z_lq = np.meshgrid(theta_grid, z_liq_grid)
+        fig.add_trace(
+            go.Surface(
+                x=x_tk + R_tk * np.cos(Theta_lq),
+                y=y_tk + R_tk * np.sin(Theta_lq),
+                z=Z_lq,
+                surfacecolor=np.full_like(Z_lq, T_tank_C),
+                colorscale=[[0, "#38b000"], [1, "#70e000"]],
+                showscale=False,
+                opacity=0.42,
+                name=f"Holding Tank Slurry (T_t={T_tank_C:.1f}°C, D90={d90_tank_um:.2f}µm)",
+                hovertemplate=(
+                    f"<b>Recirculation Holding Tank</b><br>"
+                    f"Bulk Slurry Temp T_t: {T_tank_C:.2f} °C<br>"
+                    f"Sampled Tank D90_t: {d90_tank_um:.2f} µm<br>"
+                    f"Mill Outlet D90_m: {d90_mill_um:.2f} µm<extra></extra>"
+                ),
+            )
+        )
+
+        # 2c. Holding Tank Top Free-Surface Cap
+        r_cap = np.linspace(0.0, R_tk, 6)
+        Theta_cp, R_cp = np.meshgrid(theta_grid, r_cap)
+        fig.add_trace(
+            go.Surface(
+                x=x_tk + R_cp * np.cos(Theta_cp),
+                y=y_tk + R_cp * np.sin(Theta_cp),
+                z=np.full_like(R_cp, z_slurry_lvl),
+                colorscale=[[0, "#70e000"], [1, "#38b000"]],
+                showscale=False,
+                opacity=0.55,
+                name="Tank Liquid Level",
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+
+        # 2d. Holding Tank Agitator Shaft & Marine Impeller Blades
+        z_imp_shaft = np.linspace(z_tk_bot + 0.18 * H_tk, z_tk_top + 0.15 * H_tk, 10)
+        Theta_is, Z_is = np.meshgrid(theta_grid, z_imp_shaft)
+        R_imp_sh = 0.06 * R_tk
+        fig.add_trace(
+            go.Surface(
+                x=x_tk + R_imp_sh * np.cos(Theta_is),
+                y=y_tk + R_imp_sh * np.sin(Theta_is),
+                z=Z_is,
+                colorscale=[[0, "#2f3640"], [1, "#718093"]],
+                showscale=False,
+                opacity=0.95,
+                name="Tank Mixer Impeller",
+                hoverinfo="name",
+            )
+        )
+        # Impeller disc near bottom of tank
+        r_imp_blade = np.linspace(R_imp_sh, 0.48 * R_tk, 5)
+        Theta_ib, R_ib = np.meshgrid(theta_grid, r_imp_blade)
+        fig.add_trace(
+            go.Surface(
+                x=x_tk + R_ib * np.cos(Theta_ib),
+                y=y_tk + R_ib * np.sin(Theta_ib),
+                z=np.full_like(R_ib, z_tk_bot + 0.22 * H_tk) + 0.05 * R_tk * np.sin(3 * Theta_ib),
+                colorscale=[[0, "#fbc531"], [1, "#e1b12c"]],
+                showscale=False,
+                opacity=0.92,
+                name="Tank Pitched-Blade Impeller",
+                showlegend=False,
+                hoverinfo="name",
+            )
+        )
+
+        # 2e. Peristaltic / Lobe Feed Pump Head (Centered at x_pump, y_pump, z_pump)
+        x_pump = -0.45 * L
+        y_pump = -0.82 * L
+        z_pump = z_tk_bot + 0.05 * L
+        R_pump = 0.22 * L
+        y_p_cyl = np.linspace(y_pump - 0.12 * L, y_pump + 0.12 * L, 8)
+        Theta_p, Y_p = np.meshgrid(theta_grid, y_p_cyl)
+        fig.add_trace(
+            go.Surface(
+                x=x_pump + R_pump * np.cos(Theta_p),
+                y=Y_p,
+                z=z_pump + R_pump * np.sin(Theta_p),
+                colorscale=[[0, "#e84118"], [1, "#c23616"]],
+                showscale=False,
+                opacity=0.92,
+                name=f"Recirculation Pump (Q = {Q_flow_Lmin:.2f} L/min)",
+                hovertemplate=f"<b>Peristaltic Feed Pump</b><br>Flow Rate Q: {Q_flow_Lmin:.2f} L/min<extra></extra>",
+            )
+        )
+
+        # 2f. Feed Line Pipe: Tank Bottom -> Pump -> Mill Inlet (x = 0.04*L, y = 0, z = -R_ch)
+        r_pipe = 0.055 * L
+        feed_waypoints = np.array([
+            [x_tk + R_tk * 0.65, y_tk + R_tk * 0.65, z_tk_bot + 0.06 * L],
+            [x_pump - 0.15 * L, y_pump, z_pump],
+            [x_pump + 0.15 * L, y_pump, z_pump],
+            [-0.08 * L, -0.25 * L, -0.55 * R_ch],
+            [0.04 * L, 0.0, -0.92 * R_ch],
+        ])
+        # Interpolate smooth spline-like polyline for feed pipe
+        t_wp = np.linspace(0, 1, len(feed_waypoints))
+        t_fine = np.linspace(0, 1, 36)
+        feed_path = np.column_stack([np.interp(t_fine, t_wp, feed_waypoints[:, k]) for k in range(3)])
+        Xf_p, Yf_p, Zf_p = _generate_3d_tube_mesh(feed_path, r_pipe)
+        fig.add_trace(
+            go.Surface(
+                x=Xf_p, y=Yf_p, z=Zf_p,
+                colorscale=[[0, "#00a8ff"], [1, "#0097e6"]],
+                showscale=False,
+                opacity=0.85,
+                name=f"Feed Pipe: Tank ➔ Mill ({T_tank_C:.1f} °C)",
+                hoverinfo="name",
+            )
+        )
+
+        # 2g. Return Line Pipe + In-Line Trim Heat Exchanger: Mill Outlet (x = 0.95*L) -> Tank Top
+        return_waypoints = np.array([
+            [0.95 * L, 0.0, R_ch * 0.92],
+            [0.95 * L, -0.45 * L, z_tk_top + 0.12 * L],
+            [0.25 * L, -0.95 * L, z_tk_top + 0.12 * L],
+            [-0.55 * L, -1.35 * L, z_tk_top + 0.12 * L],
+            [x_tk, y_tk + R_tk * 0.55, z_tk_top + 0.08 * L],
+            [x_tk, y_tk + R_tk * 0.55, z_slurry_lvl],
+        ])
+        t_wp_r = np.linspace(0, 1, len(return_waypoints))
+        return_path = np.column_stack([np.interp(t_fine, t_wp_r, return_waypoints[:, k]) for k in range(3)])
+        Xr_p, Yr_p, Zr_p = _generate_3d_tube_mesh(return_path, r_pipe)
+        fig.add_trace(
+            go.Surface(
+                x=Xr_p, y=Yr_p, z=Zr_p,
+                colorscale=[[0, "#ff6b6b"], [1, "#ee5253"]],
+                showscale=False,
+                opacity=0.88,
+                name=f"Return Pipe: Mill ➔ Tank ({T_mill_C:.1f} °C)",
+                hoverinfo="name",
+            )
+        )
+
+        # 2h. In-Line Shell-and-Tube Trim Heat Exchanger on Return Line
+        hx_seg = return_path[12:22]
+        X_hx, Y_hx, Z_hx = _generate_3d_tube_mesh(hx_seg, r_pipe * 2.35)
+        fig.add_trace(
+            go.Surface(
+                x=X_hx, y=Y_hx, z=Z_hx,
+                colorscale=[[0, "#00d2d3"], [1, "#01a3a4"]],
+                showscale=False,
+                opacity=0.78,
+                name="In-Line Trim Heat Exchanger (Return Line)",
+                hoverinfo="name",
+            )
+        )
+
+        # 2i. 3D Text Annotations Above Equipment Units
+        fig.add_trace(
+            go.Scatter3d(
+                x=[0.5 * L, x_tk, x_pump, float(np.mean(hx_seg[:, 0]))],
+                y=[0.0, y_tk, y_pump, float(np.mean(hx_seg[:, 1]))],
+                z=[R_jacket * 1.45, z_tk_top + 0.28 * L, z_pump + R_pump * 1.5, float(np.mean(hx_seg[:, 2])) + 0.22 * L],
+                mode="text",
+                text=[
+                    f"<b>NETZSCH {model_key[:6]} Mill</b><br>T_m={T_mill_C:.1f}°C | D90_m={d90_mill_um:.2f}µm",
+                    f"<b>Jacketed Holding Tank (Sampling Port)</b><br>T_t={T_tank_C:.1f}°C | D90_t={d90_tank_um:.2f}µm",
+                    f"<b>Feed Pump</b> ({Q_flow_Lmin:.2f} L/min)",
+                    "<b>In-Line Trim HX</b>",
+                ],
+                textfont=dict(size=11, color="#1e272e"),
+                name="Equipment Labels",
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+        cam_eye = dict(x=1.25, y=-2.15, z=1.15)
+        plot_height = 650
+    else:
+        cam_eye = dict(x=1.45, y=-1.65, z=0.95)
+        plot_height = 560
 
     fig.update_layout(
         title=dict(
             text=(
-                f"3D Digital Twin: {model_key} | Liner: {c_spec['family']} | "
-                f"Speed: {rpm:.0f} RPM ({rpm_to_tip_speed(rpm, m_spec['D_rotor_mm']):.2f} m/s)"
+                f"3D Digital Twin ({view_scope.split(' (')[0]}): {model_key[:6]} | "
+                f"Liner: {c_spec['family']} | {rpm:.0f} RPM ({rpm_to_tip_speed(rpm, m_spec['D_rotor_mm']):.2f} m/s)"
             ),
             font=dict(size=15),
         ),
         scene=dict(
-            xaxis_title="Axial Chamber Length X (mm)",
-            yaxis_title="Width Y (mm)",
-            zaxis_title="Height Z (mm)",
+            xaxis_title="X Coordinate (mm)",
+            yaxis_title="Y Coordinate (mm)",
+            zaxis_title="Z Elevation (mm)",
             aspectmode="data",
-            camera=dict(eye=dict(x=1.45, y=-1.65, z=0.95)),
+            camera=dict(eye=cam_eye),
             bgcolor="#f8f9fa",
         ),
-        height=560,
+        height=plot_height,
         margin=dict(l=0, r=0, t=45, b=0),
-        legend=dict(orientation="h", y=0.02, x=0.02, bgcolor="rgba(255,255,255,0.75)"),
+        legend=dict(orientation="h", y=0.01, x=0.01, bgcolor="rgba(255,255,255,0.80)"),
     )
     return fig
 
@@ -494,7 +725,6 @@ def build_3d_bead_mill_digital_twin(
 def assemble_numpy_base_kernel(
     x: np.ndarray, alpha: float, phi: float, gamma: float, beta: float
 ) -> np.ndarray:
-    """Assembles the time-invariant dimensionless matrix K_tilde = (b - I) @ diag(s_hat)."""
     N = len(x)
     s_hat = (x / x[0]) ** alpha
     s_hat[-1] = 0.0
@@ -517,7 +747,6 @@ def assemble_numpy_base_kernel(
 def compute_psd_quantiles_numpy(
     x: np.ndarray, w_matrix: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Computes D10, D50, D90, and Sauter Mean Diameter D32 across time."""
     x_asc = x[::-1]
     log_x_asc = np.log(x_asc)
     w_asc = np.clip(w_matrix[:, ::-1], 0.0, 1.0)
@@ -545,7 +774,6 @@ def simulate_coupled_mill_tank_loop(
     w0: np.ndarray,
     t_eval: np.ndarray,
 ) -> Dict[str, np.ndarray]:
-    """Integrates the coupled 2N + 2 non-isothermal PBE + CSTR recirculation loop via RK45."""
     x = cfg.get_size_grid()
     N = cfg.n_bins
     d32_init = float(1.0 / np.sum(w0 / x))
@@ -644,7 +872,6 @@ def compute_kwade_stress_scaling(
     sigma_se: float = 0.85,
     eps_pack: float = 0.38,
 ) -> Dict[str, float]:
-    """Computes Kwade's Stress Energy SE_GM (mJ), eta_SE, power multiplier, and S0_ref multiplier."""
     d_m = d_gm_um * 1e-6
     d_lab_m = d_gm_lab_um * 1e-6
     SE_pilot_mJ = (d_m ** 3) * (v_tip_ms ** 2) * rho_gm_kgm3 * 1e3
@@ -689,7 +916,6 @@ def compute_kwade_stress_scaling(
 def compute_thermal_and_energy_metrics(
     cfg: MillLoopConfig, sim: Dict[str, np.ndarray], w_solids_mass_frac: float = 0.24
 ) -> Dict[str, np.ndarray]:
-    """Computes instantaneous shaft power (kW), heat generation (kW), cooling duties, and E_m."""
     t_sec = sim["t"] * 60.0
     P_shaft_W = cfg.P_agit_W * ((sim["mu_eff"] / cfg.mu_ref) ** cfg.alpha_P)
     Q_gen_W = cfg.eta_diss * P_shaft_W
@@ -722,7 +948,6 @@ def solve_required_pilot_cooling(
     t_eval: np.ndarray,
     T_max_limit_K: float,
 ) -> Dict[str, float]:
-    """Bisection solver finding UA_mill_req (W/K) required to cap max(T_m(t)) <= T_max_limit_K."""
     sim_baseline = simulate_coupled_mill_tank_loop(pilot_base_cfg, scaled_params, w0, t_eval)
     peak_T_geom = float(np.max(sim_baseline["T_m"]))
 
@@ -1167,7 +1392,7 @@ sim_data = simulate_coupled_mill_tank_loop(cfg, true_params_dict, w0_vec, t_dens
 # =====================================================================
 # MAIN HEADER & KPI SUMMARY BAR
 # =====================================================================
-st.title("⚙️ NETZSCH DeltaVita® Thermo-Viscous Recirculation PBE-PINN & 3D Digital Twin")
+st.title("⚙️ NETZSCH DeltaVita® Thermo-Viscous Recirculation PBE-PINN & 3D Loop Digital Twin")
 st.markdown(
     "Deconvolve **holding-tank residence-time lag** ($\tau_t = V_t/Q$), **non-isothermal chamber wall heat transfer (316L SS vs. Ceramic)**, "
     "and **agitator RPM / tip-speed stress energy** across **NETZSCH DV 200, DV 300, DV 600, and DV 2000**."
@@ -1187,7 +1412,7 @@ kpi6.metric("Final Holding Tank D90", f"{sim_data['d90_t'][-1]:.2f} µm", f"D32 
 # WORKBENCH TABS (6 TABS — TAB 0 IS LANDING THEORY, CONSTANTS & 3D TWIN)
 # =====================================================================
 tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "0️⃣ Theory, Equations, Constants & 3D Digital Twin",
+    "0️⃣ Theory, Equations, Constants & 3D Loop Digital Twin",
     "1️⃣ Forward Digital Twin & Lag Explorer",
     "2️⃣ Experimental Tank Sampler & CSV I/O",
     "3️⃣ 3-Stage Curriculum Inverse PINN",
@@ -1196,44 +1421,58 @@ tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
 ])
 
 # ---------------------------------------------------------------------
-# TAB 0: ASSUMPTIONS, FORMULAE, EDITABLE CONSTANTS & 3D DIGITAL TWIN
+# TAB 0: ASSUMPTIONS, FORMULAE, EDITABLE CONSTANTS & 3D LOOP DIGITAL TWIN
 # ---------------------------------------------------------------------
 with tab0:
-    st.subheader("🌐 Interactive 3D CAD Digital Twin of the NETZSCH DeltaVita® Grinding Chamber")
-    c_3d_1, c_3d_2, c_3d_3 = st.columns([1.4, 1.4, 1.2])
-    viz_model_key = c_3d_1.selectbox(
+    st.subheader("🌐 Interactive 3D CAD Digital Twin: Closed-Loop Recirculation Skid & NETZSCH Grinding Chamber")
+    c_3d_1, c_3d_2, c_3d_3, c_3d_4 = st.columns([1.3, 1.3, 1.2, 1.1])
+    viz_scope = c_3d_1.selectbox(
+        "3D Digital Twin View Mode",
+        options=[
+            "Full Recirculation Loop (Tank + Pump + HX + Mill)",
+            "Mill Chamber Close-Up Only",
+        ],
+        index=0,
+    )
+    viz_model_key = c_3d_2.selectbox(
         "Inspect NETZSCH Mill Geometry in 3D",
         options=list(NETZSCH_DELTAVITA_MODELS.keys()),
         index=list(NETZSCH_DELTAVITA_MODELS.keys()).index(lab_model_key),
     )
-    viz_color_mode = c_3d_2.radio(
+    viz_color_mode = c_3d_3.radio(
         "3D Bead Cloud Color Field",
         options=["Local Stress Energy SE_GM (mJ)", "Local Slurry Temperature (°C)"],
-        horizontal=True,
+        horizontal=False,
     )
-    viz_time_min = c_3d_3.slider(
-        "Timestamp for Thermal State (min)",
+    viz_time_min = c_3d_4.slider(
+        "Process Timestamp t (min)",
         0.0, float(cfg.t_max), float(min(15.0, cfg.t_max * 0.4)), 1.0
     )
 
     idx_3d = int(np.argmin(np.abs(sim_data["t"] - viz_time_min)))
-    T_inlet_3d_C = float(sim_data["T_t"][idx_3d] - 273.15)
-    T_outlet_3d_C = float(sim_data["T_m"][idx_3d] - 273.15)
+    T_tank_3d_C = float(sim_data["T_t"][idx_3d] - 273.15)
+    T_mill_3d_C = float(sim_data["T_m"][idx_3d] - 273.15)
+    d90_tank_3d = float(sim_data["d90_t"][idx_3d])
+    d90_mill_3d = float(sim_data["d90_m"][idx_3d])
     viz_m_spec = NETZSCH_DELTAVITA_MODELS[viz_model_key]
     viz_rpm = tip_speed_to_rpm(v_tip_lab_ms, viz_m_spec["D_rotor_mm"])
 
-    fig_3d = build_3d_bead_mill_digital_twin(
+    fig_3d = build_3d_recirculation_loop_digital_twin(
         model_key=viz_model_key,
         chamber_key=lab_chamber_key,
         bead_key=lab_bead_key,
         rpm=viz_rpm,
         d_gm_um=lab_d_gm_um,
         phi_gm=lab_phi_gm,
-        T_inlet_C=T_inlet_3d_C,
-        T_outlet_C=T_outlet_3d_C,
+        Q_flow_Lmin=cfg.Q,
+        T_tank_C=T_tank_3d_C,
+        T_mill_C=T_mill_3d_C,
         T_cool_C=T_cool_C,
+        d90_tank_um=d90_tank_3d,
+        d90_mill_um=d90_mill_3d,
         SE_max_mJ=lab_kwade_mod["SE_pilot_mJ"],
         color_mode=viz_color_mode,
+        view_scope=viz_scope,
     )
     st.plotly_chart(fig_3d, use_container_width=True)
 
@@ -1251,7 +1490,7 @@ with tab0:
             2. **Zero Comminution in the Holding Tank:** Particle breakage occurs exclusively within the bead-filled mill chamber ($V_m$). The holding tank acts as a non-reactive convective buffer that introduces residence-time lag and capacitance smoothing between the mill outlet and experimental sampling port.
             3. **Hard Simplex Mass Conservation:** Discrete particle size classes $x_1 > x_2 > \\dots > x_N$ conserve total solid mass strictly ($\\sum_{i=1}^N w_{m,i}(t) = \\sum_{i=1}^N w_{t,i}(t) \\equiv 1$) via Softmax output projection and column-conservative kernel assembly ($\\mathbf{1}^\\top \\widetilde{\\mathbf{K}} = \\mathbf{0}^\\top$).
             4. **Opposing Thermo-Viscous Rheology:** Slurry viscosity $\\mu_{\\text{eff}}(T_m, \\mathbf{w}_m)$ couples continuous-phase Andrade thermal thinning against Krieger–Dougherty solids packing and specific surface area ($D_{32}^{-1}$) fines-thickening.
-            5. **1D radial-composite Fourier Wall Heat Transfer:** Jacket heat removal accounts for internal agitated slurry convection ($h_{\\text{slurry}}$), conductive resistance across the specific liner thickness ($\\delta_{\\text{liner}} / k_{\\text{liner}}$ for 316L SS, $\\text{SiC}$, $\\text{Si}_3\\text{N}_4$, or $\\text{ZrO}_2$), and external coolant convection ($h_{\\text{coolant}}$).
+            5. **1D Radial-Composite Fourier Wall Heat Transfer:** Jacket heat removal accounts for internal agitated slurry convection ($h_{\\text{slurry}}$), conductive resistance across the specific liner thickness ($\\delta_{\\text{liner}} / k_{\\text{liner}}$ for 316L SS, $\\text{SiC}$, $\\text{Si}_3\\text{N}_4$, or $\\text{ZrO}_2$), and external coolant convection ($h_{\\text{coolant}}$).
             """
         )
 
@@ -1309,7 +1548,6 @@ with tab0:
         key="constants_editor_widget",
     )
 
-    # Trigger immediate recomputation if user edits any constant value
     if not edited_df["Value"].equals(st.session_state["custom_constants_df"]["Value"]):
         st.session_state["custom_constants_df"] = edited_df.copy()
         st.rerun()
